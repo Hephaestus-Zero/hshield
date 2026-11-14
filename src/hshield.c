@@ -97,7 +97,7 @@ struct hshield_ll_net_port_attr {
 #include <time.h>
 #include <unistd.h>
 
-#define HSHIELD_VERSION        "0.2.0"
+#define HSHIELD_VERSION        "0.2.1"
 #define HSHIELD_RULE_MAGIC     0x48534844U /* "HSHD" */
 #define HSHIELD_RULE_VERSION   1U
 #define HSHIELD_MAX_RULES      512

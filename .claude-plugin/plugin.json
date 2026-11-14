@@ -1,0 +1,11 @@
+{
+  "name": "hshield",
+  "description": "Zero-overhead Linux Landlock LSM filesystem and TCP network sandbox plus AST supply-chain auditor for AI coding agents",
+  "version": "0.2.1",
+  "author": {
+    "name": "Hephaestus-Zero",
+    "url": "https://github.com/Hephaestus-Zero"
+  },
+  "repository": "https://github.com/Hephaestus-Zero/hshield",
+  "license": "MIT"
+}

@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 380" width="880" height="380" role="img" aria-label="hshield Landlock sandbox animated terminal demo">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#141923"/>
+    </linearGradient>
+    <style>
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 13px; }
+      .sm { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; }
+      .sans { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+      @keyframes a1 { 0%, 4% { opacity: 0; } 8%, 92% { opacity: 1; } 98%, 100% { opacity: 0; } }
+      @keyframes a2 { 0%, 16% { opacity: 0; } 22%, 92% { opacity: 1; } 98%, 100% { opacity: 0; } }
+      @keyframes a3 { 0%, 30% { opacity: 0; } 36%, 92% { opacity: 1; } 98%, 100% { opacity: 0; } }
+      @keyframes a4 { 0%, 46% { opacity: 0; } 52%, 92% { opacity: 1; } 98%, 100% { opacity: 0; } }
+      .s1 { animation: a1 8.5s infinite; }
+      .s2 { animation: a2 8.5s infinite; }
+      .s3 { animation: a3 8.5s infinite; }
+      .s4 { animation: a4 8.5s infinite; }
+    </style>
+  </defs>
+
+  <rect width="880" height="380" rx="12" fill="url(#bg)" stroke="#30363d" stroke-width="1.2"/>
+  <rect width="880" height="36" rx="12" fill="#161b22"/>
+  <rect y="24" width="880" height="12" fill="#161b22"/>
+  <line x1="0" y1="36" x2="880" y2="36" stroke="#21262d" stroke-width="1"/>
+  <circle cx="22" cy="18" r="5.5" fill="#ff5f56"/>
+  <circle cx="40" cy="18" r="5.5" fill="#ffbd2e"/>
+  <circle cx="58" cy="18" r="5.5" fill="#27c93f"/>
+  <text x="440" y="22" text-anchor="middle" fill="#8b949e" class="sm">linux — hshield v0.2.1 (Landlock LSM ABI v5/v6 · 0% CPU · No Root)</text>
+
+  <g class="s1">
+    <text x="24" y="66" class="mono">
+      <tspan fill="#3fb950">~/untrusted-repo</tspan>
+      <tspan fill="#8b949e"> $ </tspan>
+      <tspan fill="#f0f6fc" font-weight="600">hshield agent -- python3 eval_repo.py</tspan>
+    </text>
+  </g>
+
+  <g class="s2">
+    <rect x="24" y="80" width="832" height="28" rx="5" fill="#1f6feb" fill-opacity="0.14" stroke="#388bfd" stroke-opacity="0.35"/>
+    <text x="34" y="99" class="sm" fill="#79c0ff">[hshield] Landlock ABI v5 armed: RW=./workspace | Secrets=DENIED | TCP_CONNECT=443 only | TCP_BIND=DENIED</text>
+  </g>
+
+  <g class="s3">
+    <text x="24" y="132" class="sm" fill="#ffa198">[-] open("~/.ssh/id_ed25519", O_RDONLY)    -&gt; EACCES (Permission denied by Landlock FS)</text>
+    <text x="24" y="156" class="sm" fill="#ffa198">[-] connect("198.51.100.42:4444")          -&gt; EACCES (Blocked by Landlock TCP_CONNECT ABI v4+)</text>
+    <text x="24" y="180" class="sm" fill="#ffa198">[-] bind("0.0.0.0:9001")                   -&gt; EACCES (Blocked by Landlock TCP_BIND ABI v4+)</text>
+    <text x="24" y="210" class="sm" fill="#7ee787">[+] open("./workspace/result.json", O_WRONLY) -&gt; OK</text>
+    <text x="24" y="234" class="sm" fill="#7ee787">[+] connect("api.github.com:443")          -&gt; OK (Allowlisted TCP 443)</text>
+    <text x="24" y="258" class="sm" fill="#e6edf3">[+] eval_repo.py finished with 0 leaked keys, exit=0</text>
+  </g>
+
+  <g class="s4">
+    <rect x="24" y="294" width="832" height="62" rx="8" fill="#161b22" stroke="#2ea043" stroke-opacity="0.55"/>
+    <text x="40" y="319" class="sans" font-size="13.5" font-weight="600" fill="#e6edf3">
+      Unprivileged Kernel Containment · Zero Namespaces, Zero SUID, Zero Runtime Proxy
+    </text>
+    <text x="40" y="341" class="sm" fill="#3fb950">
+      0.0% runtime CPU overhead · enforced in kernel after PR_SET_NO_NEW_PRIVS + execve
+    </text>
+    <rect x="720" y="307" width="120" height="36" rx="6" fill="#238636"/>
+    <text x="780" y="330" text-anchor="middle" class="mono" font-weight="700" fill="#ffffff">0% CPU</text>
+  </g>
+</svg>

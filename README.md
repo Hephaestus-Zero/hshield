@@ -6,20 +6,34 @@
 
 `hshield` is a zero-runtime-overhead C11 defensive security toolkit for Linux workstations, CI runners, and AI coding agents operating on untrusted repositories, build hooks, and serialized ML artifacts. It unifies unprivileged Linux **Landlock LSM** (`ABI v1–v6`) filesystem, TCP port, and IPC isolation, coding-agent `.mcp.json` and Trojan-Source repository auditing, zero-import **Pickle VM (Protocols 0–5) / PyTorch ZIP** static RCE scanning, and optional `fanotify`/`CN_PROC` runtime execution containment.
 
+![hshield Landlock sandbox animated terminal demo](assets/demo.svg)
+
 ## Quick Install
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Hephaestus-Zero/hshield/main/install.sh | sh
-```
+- **Homebrew (Linuxbrew):**
+  ```bash
+  brew install Hephaestus-Zero/tap/hshield
+  ```
+- **Agent Skill / Claude Code Plugin:**
+  ```bash
+  npx skills add Hephaestus-Zero/hshield
+  # or in Claude Code:
+  # /plugin marketplace add Hephaestus-Zero/hshield
+  ```
+- **Prebuilt Binary (`x86_64` Linux):**
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/Hephaestus-Zero/hshield/main/install.sh | sh
+  ```
 
 Or build locally with `gcc`, `libcrypto`, and `zlib`:
 
 ```bash
 make
 make test
+sudo make install   # or: make install PREFIX="$HOME/.local"
 ```
 
-## Coding-Agent & Sandbox Usage (`v0.2.0`)
+## Coding-Agent & Sandbox Usage (`v0.2.1`)
 
 ```bash
 # 1. Agent preset: hide ~/.ssh, ~/.aws, browser cookies & dotfiles; RW only on cwd; allow only outbound TCP 443
@@ -45,7 +59,7 @@ hshield-supply-scan --json model_weights.pt dataset.pkl archive.zip
 Drop `hshield` directly into any repository CI workflow to catch `.mcp.json` / `.claude` hook traps, invisible Unicode Trojan-Source overrides, disguised ELFs, and Pickle RCE payloads on pull requests:
 
 ```yaml
-- uses: Hephaestus-Zero/hshield@v0.2.0
+- uses: Hephaestus-Zero/hshield@v0.2.1
   with:
     path: .
     scan-artifacts: 'true'

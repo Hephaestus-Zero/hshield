@@ -1,5 +1,5 @@
-hshield
-hshield-supply-scan
+/hshield
+/hshield-supply-scan
 *.o
 __pycache__/
 .pytest_cache/

@@ -1,0 +1,14 @@
+{
+  "name": "hephaestus-zero",
+  "owner": {
+    "name": "Hephaestus-Zero",
+    "url": "https://github.com/Hephaestus-Zero"
+  },
+  "plugins": [
+    {
+      "name": "hshield",
+      "source": "./",
+      "description": "Zero-overhead Linux Landlock LSM agent sandbox (ABI v5/v6 FS + TCP ports) & supply-chain auditor"
+    }
+  ]
+}
