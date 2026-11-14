@@ -1,0 +1,18 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev zlib1g-dev linux-libc-dev
+      - name: Compile with -Werror
+        run: make
+      - name: Run containment and supply-chain test suite
+        run: make test
