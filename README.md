@@ -1,5 +1,8 @@
 # hshield — Linux Kernel Containment & Supply-Chain Security Engine
 
+[![CI](https://github.com/Hephaestus-Zero/hshield/actions/workflows/ci.yml/badge.svg)](https://github.com/Hephaestus-Zero/hshield/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 `hshield` is a zero-dependency C11 defensive security toolkit for Linux workstations and developer environments running untrusted repositories, build scripts, and machine-learning artifacts. It combines unprivileged Linux Security Module (**Landlock LSM**) process sandboxing, privileged runtime telemetry/containment (`fanotify` + `CN_PROC` + `AES-256-GCM` quarantine), AI coding-agent repository trap auditing, and zero-execution **Pickle VM / ZIP** static supply-chain scanning.
 
 ## Threat Model & Defensive Scope

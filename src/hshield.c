@@ -37,6 +37,21 @@
 #include <linux/connector.h>
 #include <linux/fs.h>
 #include <linux/landlock.h>
+#ifndef LANDLOCK_ACCESS_FS_REFER
+#define LANDLOCK_ACCESS_FS_REFER (1ULL << 13)
+#endif
+#ifndef LANDLOCK_ACCESS_FS_TRUNCATE
+#define LANDLOCK_ACCESS_FS_TRUNCATE (1ULL << 14)
+#endif
+#ifndef LANDLOCK_ACCESS_FS_IOCTL_DEV
+#define LANDLOCK_ACCESS_FS_IOCTL_DEV (1ULL << 15)
+#endif
+#ifndef LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET
+#define LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET (1ULL << 0)
+#endif
+#ifndef LANDLOCK_SCOPE_SIGNAL
+#define LANDLOCK_SCOPE_SIGNAL (1ULL << 1)
+#endif
 #include <linux/netlink.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -780,8 +795,9 @@ static void ingest_antibody_zeromemory_async(const char *title, const char *body
     pid_t pid = fork();
     if (pid == 0) {
         /* Drop to unprivileged target user & clear all capabilities so child zmd/hzm is 100% dumpable/inspectable */
-        (void)setgid(USER_GID);
-        (void)setuid(USER_UID);
+        if (setgid(USER_GID) != 0 || setuid(USER_UID) != 0) {
+            _exit(1);
+        }
         (void)prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
         struct __user_cap_header_struct hdr = { _LINUX_CAPABILITY_VERSION_3, 0 };
         struct __user_cap_data_struct data[2];
@@ -1094,7 +1110,10 @@ static bool lookup_tcp_remote_by_inode(unsigned long sock_ino, char *ip_out, siz
     if (!fp) return false;
     char line[512];
     bool found = false;
-    (void)fgets(line, sizeof(line), fp); /* header */
+    if (!fgets(line, sizeof(line), fp)) { /* header */
+        fclose(fp);
+        return false;
+    }
     while (fgets(line, sizeof(line), fp)) {
         unsigned int sl = 0, l_ip = 0, l_port = 0, r_ip = 0, r_port = 0, st = 0;
         unsigned long ino = 0;
@@ -2294,7 +2313,7 @@ static void handle_fanotify_events(int ffd) {
                         strcmp(pm.comm, "rg") != 0 && strcmp(pm.comm, "git") != 0) {
                         /* Queue task-scoped SIGSTOP BEFORE releasing FAN_DENY so attacker freezes with 0 bytes read! */
                         uint64_t freeze_us = amber_freeze_task(&pm);
-                        (void)write(ffd, &resp, sizeof(resp));
+                        if (write(ffd, &resp, sizeof(resp)) < 0) {}
                         close(md->fd);
                         if (!recently_handled_pid(pm.pid)) {
                             surgeon_record_and_respond(
@@ -2316,7 +2335,7 @@ static void handle_fanotify_events(int ffd) {
                         refresh_status_shm(true);
                     }
                 }
-                (void)write(ffd, &resp, sizeof(resp));
+                if (write(ffd, &resp, sizeof(resp)) < 0) {}
             }
             close(md->fd);
         }
@@ -2463,7 +2482,7 @@ static void enqueue_micro_inspect(int tfd, const ProcMeta *pm) {
 
 static void handle_micro_inspect_timer(int tfd) {
     uint64_t exp = 0;
-    (void)read(tfd, &exp, sizeof(exp));
+    if (read(tfd, &exp, sizeof(exp)) < 0) {}
     uint64_t now = mono_ns();
     for (int i = 0; i < MAX_PENDING_INSPECT; i++) {
         if (g_pending[i].pid <= 0 || g_pending[i].due_ns > now) continue;
@@ -2700,7 +2719,7 @@ static void handle_control_client(int sfd, int ifd, int ffd) {
                  HSHIELD_VERSION, g_shadow_mode ? "shadow" : "enforce");
     }
 
-    (void)write(cfd, reply, strlen(reply));
+    if (write(cfd, reply, strlen(reply)) < 0) {}
     close(cfd);
 }
 
