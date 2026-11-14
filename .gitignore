@@ -3,3 +3,4 @@ hshield-supply-scan
 *.o
 __pycache__/
 .pytest_cache/
+dist/

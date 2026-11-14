@@ -1,0 +1,39 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  publish-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev zlib1g-dev linux-libc-dev
+      - name: Build static-minimal release binaries
+        run: make CFLAGS="-std=c11 -O3 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -Wall -Wextra -Werror"
+      - name: Run verification suite before packaging
+        run: make test
+      - name: Package Linux x86_64 release tarball & checksums
+        run: |
+          mkdir -p dist
+          strip hshield hshield-supply-scan
+          tar -czf dist/hshield-linux-x86_64.tar.gz hshield hshield-supply-scan LICENSE README.md
+          (cd dist && sha256sum hshield-linux-x86_64.tar.gz > SHA256SUMS)
+      - name: Upload assets to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" dist/hshield-linux-x86_64.tar.gz dist/SHA256SUMS --clobber
+          else
+            gh release create "${TAG}" dist/hshield-linux-x86_64.tar.gz dist/SHA256SUMS \
+              --title "hshield ${TAG}" \
+              --generate-notes
+          fi

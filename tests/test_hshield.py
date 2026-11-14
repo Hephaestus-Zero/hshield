@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 import pickle
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -126,6 +127,89 @@ class TestHShieldContainmentAndStaticGates(unittest.TestCase):
             r4 = subprocess.run([str(SCAN_BIN), "--json", str(fake_pdf)], capture_output=True, text=True)
             self.assertEqual(r4.returncode, 1)
             self.assertEqual(json.loads(r4.stdout)["finding"], "disguised-elf-binary-as-pdf")
+
+    def test_04_landlock_tcp_network_confinement(self) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv_allow, \
+             socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv_block:
+            srv_allow.bind(("127.0.0.1", 0))
+            srv_allow.listen(4)
+            port_allowed = srv_allow.getsockname()[1]
+
+            srv_block.bind(("127.0.0.1", 0))
+            srv_block.listen(4)
+            port_blocked = srv_block.getsockname()[1]
+
+            # 1. --deny-net blocks all TCP outbound connections
+            deny_run = subprocess.run(
+                [
+                    str(HSHIELD_BIN),
+                    "sandbox",
+                    "--deny-net",
+                    "--",
+                    "python3",
+                    "-c",
+                    f"import socket; s = socket.create_connection(('127.0.0.1', {port_allowed}), timeout=2.0); s.close()",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if "Landlock LSM unavailable" in deny_run.stderr or "TCP confinement unavailable" in deny_run.stderr:
+                self.skipTest("Host kernel lacks Landlock ABI v4+ TCP confinement")
+            self.assertNotEqual(deny_run.returncode, 0)
+
+            # 2. --deny-net --allow-tcp-connect <port_allowed> permits allowed port...
+            allow_run = subprocess.run(
+                [
+                    str(HSHIELD_BIN),
+                    "sandbox",
+                    "--deny-net",
+                    "--allow-tcp-connect",
+                    str(port_allowed),
+                    "--",
+                    "python3",
+                    "-c",
+                    f"import socket; s = socket.create_connection(('127.0.0.1', {port_allowed}), timeout=2.0); s.close()",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(allow_run.returncode, 0, msg=allow_run.stderr)
+
+            # 3. ...while still blocking non-whitelisted TCP connect ports
+            block_other = subprocess.run(
+                [
+                    str(HSHIELD_BIN),
+                    "sandbox",
+                    "--deny-net",
+                    "--allow-tcp-connect",
+                    str(port_allowed),
+                    "--",
+                    "python3",
+                    "-c",
+                    f"import socket; s = socket.create_connection(('127.0.0.1', {port_blocked}), timeout=2.0); s.close()",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(block_other.returncode, 0)
+
+            # 4. ...and blocking TCP bind() when no --allow-tcp-bind port is specified
+            block_bind = subprocess.run(
+                [
+                    str(HSHIELD_BIN),
+                    "sandbox",
+                    "--deny-net",
+                    "--allow-tcp-connect",
+                    str(port_allowed),
+                    "--",
+                    "python3",
+                    "-c",
+                    "import socket; s = socket.socket(); s.bind(('127.0.0.1', 0)); s.close()",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(block_bind.returncode, 0)
 
 
 if __name__ == "__main__":

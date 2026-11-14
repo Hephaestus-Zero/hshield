@@ -52,6 +52,19 @@
 #ifndef LANDLOCK_SCOPE_SIGNAL
 #define LANDLOCK_SCOPE_SIGNAL (1ULL << 1)
 #endif
+#ifndef LANDLOCK_ACCESS_NET_BIND_TCP
+#define LANDLOCK_ACCESS_NET_BIND_TCP (1ULL << 0)
+#endif
+#ifndef LANDLOCK_ACCESS_NET_CONNECT_TCP
+#define LANDLOCK_ACCESS_NET_CONNECT_TCP (1ULL << 1)
+#endif
+/* LANDLOCK_RULE_NET_PORT is an enum constant (value 2) in newer kernel headers,
+ * so define an ABI-identical cast and unpacked struct usable back to Linux 5.13 headers. */
+#define HSHIELD_LL_RULE_NET_PORT ((enum landlock_rule_type)2)
+struct hshield_ll_net_port_attr {
+    __u64 allowed_access;
+    __u64 port;
+};
 #include <linux/netlink.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -84,7 +97,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define HSHIELD_VERSION        "5.1.0"
+#define HSHIELD_VERSION        "0.2.0"
 #define HSHIELD_RULE_MAGIC     0x48534844U /* "HSHD" */
 #define HSHIELD_RULE_VERSION   1U
 #define HSHIELD_MAX_RULES      512
@@ -129,6 +142,11 @@ typedef struct {
 /* Kernel ABI-compatible minimal Landlock ruleset structs */
 struct ll_ruleset_abi_v1 {
     __u64 handled_access_fs;
+};
+
+struct ll_ruleset_abi_v4 {
+    __u64 handled_access_fs;
+    __u64 handled_access_net;
 };
 
 struct ll_ruleset_abi_v6 {
@@ -2878,23 +2896,111 @@ static bool is_sensitive_config_entry(const char *name) {
     return false;
 }
 
-static int cmd_sandbox(int argc, char **argv) {
+#define HSHIELD_MAX_PORTS 64
+
+static void add_unique_port(uint16_t *out, int *count, int max_ports, uint16_t port) {
+    for (int i = 0; i < *count; i++) {
+        if (out[i] == port) return;
+    }
+    if (*count < max_ports) {
+        out[(*count)++] = port;
+    }
+}
+
+static bool parse_port_list(const char *csv, uint16_t *out, int *count, int max_ports, bool allow_zero) {
+    if (!csv || !csv[0]) return false;
+    const char *p = csv;
+    while (*p) {
+        if (*p == ',') { p++; continue; }
+        if (!isdigit((unsigned char)*p)) return false;
+        char *endp = NULL;
+        errno = 0;
+        unsigned long val = strtoul(p, &endp, 10);
+        if (errno != 0 || endp == p || val > 65535UL || (!allow_zero && val == 0UL)) {
+            return false;
+        }
+        if (*count >= max_ports) {
+            return false;
+        }
+        add_unique_port(out, count, max_ports, (uint16_t)val);
+        if (*endp == '\0') break;
+        if (*endp != ',') return false;
+        p = endp + 1;
+        if (*p == '\0') return false;
+    }
+    return *count > 0;
+}
+
+static int landlock_allow_tcp_port(int rfd, uint16_t port, uint64_t access) {
+    struct hshield_ll_net_port_attr npa;
+    memset(&npa, 0, sizeof(npa));
+    npa.allowed_access = access;
+    npa.port = (uint64_t)port;
+    return ll_add_rule(rfd, HSHIELD_LL_RULE_NET_PORT, &npa, 0);
+}
+
+static void print_sandbox_usage(void) {
+    fprintf(stderr,
+            "Usage:\n"
+            "  hshield sandbox [--allow-write <dir>] [--deny-net] [--allow-tcp-connect <ports>]\n"
+            "                  [--allow-tcp-bind <ports>] [--strict-net] [--agent] -- <cmd...>\n"
+            "  hshield agent   [--allow-write <dir>] [--allow-tcp-connect <ports>] -- <cmd...>\n");
+}
+
+static int cmd_sandbox_impl(int argc, char **argv, bool default_agent) {
     const char *allow_write_dir = NULL;
+    bool deny_net = false;
+    bool strict_net = false;
+    bool agent_preset = default_agent;
+    uint16_t connect_ports[HSHIELD_MAX_PORTS];
+    int n_connect_ports = 0;
+    uint16_t bind_ports[HSHIELD_MAX_PORTS];
+    int n_bind_ports = 0;
     int cmd_idx = -1;
+
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--allow-write") == 0 && i + 1 < argc) {
             allow_write_dir = argv[++i];
+        } else if (strcmp(argv[i], "--deny-net") == 0) {
+            deny_net = true;
+        } else if (strcmp(argv[i], "--strict-net") == 0) {
+            strict_net = true;
+        } else if (strcmp(argv[i], "--agent") == 0) {
+            agent_preset = true;
+        } else if (strcmp(argv[i], "--allow-tcp-connect") == 0 && i + 1 < argc) {
+            if (!parse_port_list(argv[++i], connect_ports, &n_connect_ports, HSHIELD_MAX_PORTS, false)) {
+                fprintf(stderr, "hshield sandbox: invalid --allow-tcp-connect port list\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--allow-tcp-bind") == 0 && i + 1 < argc) {
+            if (!parse_port_list(argv[++i], bind_ports, &n_bind_ports, HSHIELD_MAX_PORTS, true)) {
+                fprintf(stderr, "hshield sandbox: invalid --allow-tcp-bind port list\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            print_sandbox_usage();
+            return 0;
         } else if (strcmp(argv[i], "--") == 0) {
             cmd_idx = i + 1;
             break;
-        } else if (argv[i][0] != '-') {
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "hshield sandbox: unknown or incomplete option: %s\n", argv[i]);
+            print_sandbox_usage();
+            return 2;
+        } else {
             cmd_idx = i;
             break;
         }
     }
     if (cmd_idx < 0 || cmd_idx >= argc) {
-        fprintf(stderr, "Usage: hshield sandbox [--allow-write <dir>] -- <cmd...>\n");
+        print_sandbox_usage();
         return 2;
+    }
+
+    if (agent_preset) {
+        if (!allow_write_dir || !allow_write_dir[0]) allow_write_dir = ".";
+        deny_net = true;
+        add_unique_port(connect_ports, &n_connect_ports, HSHIELD_MAX_PORTS, 443);
     }
 
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
@@ -2920,23 +3026,78 @@ static int cmd_sandbox(int argc, char **argv) {
         fs_rw |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
     }
 
+    uint64_t net_handled = 0;
+    if (deny_net) {
+        net_handled |= LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP;
+    }
+    if (n_connect_ports > 0) {
+        net_handled |= LANDLOCK_ACCESS_NET_CONNECT_TCP;
+    }
+    if (n_bind_ports > 0) {
+        net_handled |= LANDLOCK_ACCESS_NET_BIND_TCP;
+    }
+
+    if (net_handled != 0 && abi < 4) {
+        if (strict_net) {
+            fprintf(stderr,
+                    "hshield sandbox: Landlock ABI v%d < 4; TCP confinement requires Linux >= 6.7 (--strict-net)\n",
+                    abi);
+            return 1;
+        }
+        fprintf(stderr,
+                "hshield sandbox: warning: kernel Landlock ABI v%d < 4; TCP confinement unavailable, enforcing filesystem containment\n",
+                abi);
+        net_handled = 0;
+    }
+
     int rfd = -1;
     if (abi >= 6) {
         struct ll_ruleset_abi_v6 attr6;
         memset(&attr6, 0, sizeof(attr6));
         attr6.handled_access_fs = fs_rw;
+        attr6.handled_access_net = net_handled;
         attr6.scoped = LANDLOCK_SCOPE_SIGNAL | LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET;
         rfd = ll_create_ruleset(&attr6, sizeof(attr6), 0);
+    } else if (abi >= 4 && net_handled != 0) {
+        struct ll_ruleset_abi_v4 attr4;
+        memset(&attr4, 0, sizeof(attr4));
+        attr4.handled_access_fs = fs_rw;
+        attr4.handled_access_net = net_handled;
+        rfd = ll_create_ruleset(&attr4, sizeof(attr4), 0);
     }
     if (rfd < 0) {
+        if (net_handled != 0 && strict_net) {
+            perror("landlock_create_ruleset(ABI net)");
+            return 1;
+        }
         struct ll_ruleset_abi_v1 attr1;
         memset(&attr1, 0, sizeof(attr1));
         attr1.handled_access_fs = fs_rw;
         rfd = ll_create_ruleset(&attr1, sizeof(attr1), 0);
+        net_handled = 0;
     }
     if (rfd < 0) {
         perror("landlock_create_ruleset");
         return 1;
+    }
+
+    if ((net_handled & LANDLOCK_ACCESS_NET_CONNECT_TCP) != 0) {
+        for (int i = 0; i < n_connect_ports; i++) {
+            if (landlock_allow_tcp_port(rfd, connect_ports[i], LANDLOCK_ACCESS_NET_CONNECT_TCP) != 0) {
+                perror("landlock_add_rule(NET_CONNECT_TCP)");
+                close(rfd);
+                return 1;
+            }
+        }
+    }
+    if ((net_handled & LANDLOCK_ACCESS_NET_BIND_TCP) != 0) {
+        for (int i = 0; i < n_bind_ports; i++) {
+            if (landlock_allow_tcp_port(rfd, bind_ports[i], LANDLOCK_ACCESS_NET_BIND_TCP) != 0) {
+                perror("landlock_add_rule(NET_BIND_TCP)");
+                close(rfd);
+                return 1;
+            }
+        }
     }
 
     /* 1. Read-Only OS & Persistence Paths (0 write access to /etc, /usr, /var/spool/cron!) */
@@ -3001,6 +3162,10 @@ static int cmd_sandbox(int argc, char **argv) {
     execvp(argv[cmd_idx], &argv[cmd_idx]);
     perror("execvp");
     return 127;
+}
+
+static int cmd_sandbox(int argc, char **argv) {
+    return cmd_sandbox_impl(argc, argv, false);
 }
 
 /* =========================================================================
@@ -3474,6 +3639,7 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "--daemon") == 0) return run_daemon(argc, argv);
     if (strcmp(argv[1], "sandbox") == 0) return cmd_sandbox(argc, argv);
+    if (strcmp(argv[1], "agent") == 0) return cmd_sandbox_impl(argc, argv, true);
     if (strcmp(argv[1], "audit") == 0) return cmd_audit(argc, argv);
     if (strcmp(argv[1], "quarantine") == 0) return cmd_quarantine(argc, argv);
     if (strcmp(argv[1], "evolve") == 0) return cmd_evolve(argc, argv);
@@ -3483,7 +3649,11 @@ int main(int argc, char **argv) {
     printf("hshield v%s — Zero-Overhead Kernel & Cognitive General Immunity Layer\n"
            "Usage:\n"
            "  hshield status [--json]                      Show live immunity status & counters\n"
-           "  hshield sandbox [--allow-write DIR] -- CMD   Run CMD inside 0%%-CPU Landlock LSM armor\n"
+           "  hshield sandbox [--allow-write DIR] [--deny-net] [--allow-tcp-connect PORTS]\n"
+           "                  [--allow-tcp-bind PORTS] [--strict-net] [--agent] -- CMD\n"
+           "                                               Run CMD inside 0%%-CPU Landlock LSM armor\n"
+           "  hshield agent   [--allow-write DIR] [--allow-tcp-connect PORTS] -- CMD\n"
+           "                                               Coding-agent preset (RW cwd + HTTPS 443)\n"
            "  hshield audit [DIR] [--json]                 Verify MCP pins & scan repo for AI traps\n"
            "  hshield quarantine [list|inspect ID|add F R] Manage AES-256-GCM quarantine vault\n"
            "  hshield evolve [--file F|--sha256 H|--pattern P] [--reason R]\n"

@@ -1,0 +1,50 @@
+name: 'hshield Supply-Chain & Agent Trap Audit'
+description: 'Audit repositories for coding-agent traps (.mcp.json, hooks, Trojan-Source Unicode) and Pickle/PyTorch RCE payloads'
+author: 'Hephaestus-Zero'
+branding:
+  icon: 'shield'
+  color: 'blue'
+inputs:
+  path:
+    description: 'Target directory to audit'
+    required: false
+    default: '.'
+  scan-artifacts:
+    description: 'Scan .pkl, .pt, .pth, .ckpt, and .zip files with hshield-supply-scan'
+    required: false
+    default: 'true'
+runs:
+  using: 'composite'
+  steps:
+    - name: Build and run hshield audit
+      shell: bash
+      run: |
+        set -euo pipefail
+        BIN_DIR="${RUNNER_TEMP:-/tmp}/hshield-action-bin"
+        mkdir -p "${BIN_DIR}"
+        cc -std=c11 -O3 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -Wall -Wextra -Werror \
+          -o "${BIN_DIR}/hshield" "${{ github.action_path }}/src/hshield.c" -lcrypto
+        cc -std=c11 -O3 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -Wall -Wextra -Werror \
+          -o "${BIN_DIR}/hshield-supply-scan" "${{ github.action_path }}/src/hshield_supply_scan.c" -lz
+        echo "${BIN_DIR}" >> "${GITHUB_PATH}"
+
+        TARGET="${{ inputs.path }}"
+        echo "::group::hshield audit (${TARGET})"
+        "${BIN_DIR}/hshield" audit "${TARGET}" --json
+        echo "::endgroup::"
+
+        if [ "${{ inputs.scan-artifacts }}" = "true" ]; then
+          echo "::group::hshield-supply-scan"
+          failed=0
+          while IFS= read -r -d '' artifact; do
+            if ! "${BIN_DIR}/hshield-supply-scan" --json "${artifact}"; then
+              failed=1
+            fi
+          done < <(find "${TARGET}" -path '*/.git' -prune -o -type f \
+            \( -name '*.pkl' -o -name '*.pt' -o -name '*.pth' -o -name '*.ckpt' -o -name '*.zip' \) -print0)
+          echo "::endgroup::"
+          if [ "${failed}" -ne 0 ]; then
+            echo "::error::hshield-supply-scan flagged malicious serialized or disguised artifact"
+            exit 1
+          fi
+        fi
