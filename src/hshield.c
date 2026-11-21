@@ -93,6 +93,7 @@ struct hshield_ll_net_port_attr {
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <elf.h>
+#include <pwd.h>
 #include <sched.h>
 #include <time.h>
 #include <unistd.h>
@@ -104,13 +105,11 @@ struct hshield_ll_net_port_attr {
 
 #define SHM_STATUS_PATH        "/dev/shm/hephaestus_shield_status.json"
 #define SHM_RULES_BIN_PATH     "/dev/shm/hephaestus_shield_rules.bin"
-#define ETC_DIR_PATH           "/etc/hephaestus"
-#define ETC_RULES_JSON_PATH    "/etc/hephaestus/shield_rules.json"
-#define ETC_MCP_PINS_PATH      "/etc/hephaestus/mcp_pins.json"
-#define ETC_QKEY_PATH          "/etc/hephaestus/quarantine.key"
-#define CTRL_SOCK_PATH         "/run/hephaestus-shield.sock"
+#define ETC_DIR_PATH           "/etc/hshield"
+#define ETC_RULES_JSON_PATH    "/etc/hshield/shield_rules.json"
+#define ETC_QKEY_PATH          "/etc/hshield/quarantine.key"
+#define CTRL_SOCK_PATH         "/run/hshield.sock"
 
-#define USER_HOME              "/home/user"
 #define USER_UID               1000
 #define USER_GID               1000
 #define STATE_BASE_DIR         "/var/lib/hshield"
@@ -239,6 +238,22 @@ static int      g_handled_idx = 0;
 static void on_sigterm(int sig) {
     (void)sig;
     g_stop = 1;
+}
+
+static void resolve_home_dir(char *out, size_t cap) {
+    if (cap == 0) return;
+    const char *env_h = getenv("HSHIELD_TARGET_HOME");
+    if (!env_h || !env_h[0]) env_h = getenv("HOME");
+    if (env_h && env_h[0]) {
+        snprintf(out, cap, "%s", env_h);
+        return;
+    }
+    struct passwd *pw = getpwuid(getuid());
+    if (pw && pw->pw_dir && pw->pw_dir[0]) {
+        snprintf(out, cap, "%s", pw->pw_dir);
+        return;
+    }
+    snprintf(out, cap, "/tmp");
 }
 
 static uint64_t mono_ns(void) {
@@ -809,41 +824,7 @@ static bool add_immune_rule(const uint8_t *sha256_opt, const char *pattern_opt, 
     return true;
 }
 
-static void ingest_antibody_zeromemory_async(const char *title, const char *body) {
-    pid_t pid = fork();
-    if (pid == 0) {
-        /* Drop to unprivileged target user & clear all capabilities so child zmd/hzm is 100% dumpable/inspectable */
-        if (setgid(USER_GID) != 0 || setuid(USER_UID) != 0) {
-            _exit(1);
-        }
-        (void)prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
-        struct __user_cap_header_struct hdr = { _LINUX_CAPABILITY_VERSION_3, 0 };
-        struct __user_cap_data_struct data[2];
-        memset(data, 0, sizeof(data));
-        (void)syscall(SYS_capset, &hdr, data);
-        (void)prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
-        int lfd = open("/dev/shm/hshield_zm_ingest.lock", O_CREAT | O_RDWR | O_CLOEXEC, 0600);
-        if (lfd >= 0 && flock(lfd, LOCK_EX | LOCK_NB) != 0) {
-            _exit(0); /* Another antibody ingest is already in flight; shield_rules.bin has all rules! */
-        }
-        setenv("HOME", USER_HOME, 1);
-        setenv("XDG_RUNTIME_DIR", "/run/user/1000", 1);
-        setenv("TMPDIR", "/tmp", 1);
-        setenv("SQLITE_TMPDIR", "/tmp", 1);
-        int devnull = open("/dev/null", O_RDWR);
-        if (devnull >= 0) {
-            (void)dup2(devnull, STDIN_FILENO);
-            (void)dup2(devnull, STDOUT_FILENO);
-            (void)dup2(devnull, STDERR_FILENO);
-            if (devnull > 2) close(devnull);
-        }
-        execl("/usr/local/bin/hzm", "hzm", "ingest",
-              "-k", "lesson", "--importance", "0.86",
-              "-p", "hephaestus-core",
-              "-t", title, "-b", body, (char *)NULL);
-        _exit(0);
-    }
-}
+/* Autonomous antibody rules are persisted directly to g_rules_shm + g_rules_json_path. */
 
 /* =========================================================================
  * AES-256-GCM Quarantine Encryption & `nftables` C2 Block + `hrollback`
@@ -1022,10 +1003,10 @@ static bool files_equal_fast(const char *p1, const char *p2) {
 }
 
 static bool is_sacred_data_path(const char *p) {
-    return (strncmp(p, "/opt/protected-workloads/", 27) == 0 ||
-            strncmp(p, "/var/lib/protected-memory/", 20) == 0 ||
-            strncmp(p, "/var/lib/protected-index", 36) == 0 ||
-            strncmp(p, "/etc/hshield/protected-browser/", 35) == 0);
+    return (strncmp(p, "/opt/protected-workloads/", sizeof("/opt/protected-workloads/") - 1) == 0 ||
+            strncmp(p, "/var/lib/protected-memory/", sizeof("/var/lib/protected-memory/") - 1) == 0 ||
+            strncmp(p, "/var/lib/protected-index", sizeof("/var/lib/protected-index") - 1) == 0 ||
+            strncmp(p, "/etc/hshield/protected-browser/", sizeof("/etc/hshield/protected-browser/") - 1) == 0);
 }
 
 /*
@@ -1036,12 +1017,9 @@ static bool restore_file_cow_fast(const char *target_path, uint64_t *elapsed_us_
     uint64_t t0 = mono_ns();
     if (!target_path || target_path[0] != '/' || is_sacred_data_path(target_path)) return false;
 
-    const char *snap_base = "/.snapshots";
+    const char *snap_env = getenv("HSHIELD_SNAPSHOT_BASE");
+    const char *snap_base = (snap_env && snap_env[0]) ? snap_env : "/.snapshots";
     const char *rel = target_path + 1;
-    if (strncmp(target_path, "/home/", 6) == 0) {
-        snap_base = "/home/.snapshots";
-        rel = target_path + 6;
-    }
 
     DIR *d = opendir(snap_base);
     if (!d) return false;
@@ -1875,7 +1853,10 @@ static void clean_persistence_artifacts(const ProcMeta *pm, char *cleaned_summar
     }
 
     /* 2. Check ~/.config/systemd/user for newly dropped untrusted persistence units */
-    const char *u_sysd = USER_HOME "/.config/systemd/user";
+    char target_home[PATH_MAX];
+    resolve_home_dir(target_home, sizeof(target_home));
+    char u_sysd[PATH_MAX + 32];
+    snprintf(u_sysd, sizeof(u_sysd), "%s/.config/systemd/user", target_home);
     DIR *d = opendir(u_sysd);
     if (d) {
         time_t now = time(NULL);
@@ -1889,8 +1870,8 @@ static void clean_persistence_artifacts(const ProcMeta *pm, char *cleaned_summar
                 strncmp(de->d_name, "zero-lifelog", 12) == 0) {
                 continue;
             }
-            char upath[512];
-            snprintf(upath, sizeof(upath), "%s/%.200s", u_sysd, de->d_name);
+            char upath[PATH_MAX + 256];
+            snprintf(upath, sizeof(upath), "%.*s/%.200s", (int)(sizeof(upath) - 210), u_sysd, de->d_name);
             struct stat ust;
             if (stat(upath, &ust) == 0 && (now - ust.st_mtime) <= 15) {
                 char ubuf[2048];
@@ -2139,15 +2120,7 @@ static void surgeon_record_and_respond(const ProcMeta *pm, const char *trigger,
              inc_id, trigger, dec_str, (int)pm->pid, freeze_us);
     refresh_status_shm(true);
 
-    if (!g_shadow_mode && conf == CONF_HIGH) {
-        char zm_title[160], zm_body[512];
-        snprintf(zm_title, sizeof(zm_title), "hshield Antibody: %.80s", trigger);
-        snprintf(zm_body, sizeof(zm_body),
-                 "Threat %.80s neutralized in %" PRIu64 "us freeze / %" PRIu64 "us surgeon. "
-                 "exe=%.100s sha256=%.64s remediation=%.100s",
-                 trigger, freeze_us, total_us, pm->exe, sha_hex, cleaned_buf[0] ? cleaned_buf : "quarantined");
-        ingest_antibody_zeromemory_async(zm_title, zm_body);
-    }
+    (void)total_us;
 }
 
 /* =========================================================================
@@ -2234,16 +2207,30 @@ static bool match_compiled_antibody(const ProcMeta *pm, char *reason_out, size_t
 /* =========================================================================
  * Canary Traps (`fanotify`), Persistence (`inotify`), & `CN_PROC` Setup
  * ========================================================================= */
-static const char *CANARY_PATHS[] = {
-    USER_HOME "/.ssh/.id_ed25519_prod_canary",
-    VAULT_DIR "/.canary_master.key",
-    USER_HOME "/.gnupg/.secring_canary.gpg"
+static char g_canary_paths[3][PATH_MAX + 64];
+static const char *CANARY_PATHS[3] = {
+    g_canary_paths[0],
+    g_canary_paths[1],
+    g_canary_paths[2]
 };
 
+static void init_canary_paths(void) {
+    char home[PATH_MAX];
+    resolve_home_dir(home, sizeof(home));
+    snprintf(g_canary_paths[0], sizeof(g_canary_paths[0]), "%s/.ssh/.id_ed25519_prod_canary", home);
+    snprintf(g_canary_paths[1], sizeof(g_canary_paths[1]), "%s/.canary_master.key", VAULT_DIR);
+    snprintf(g_canary_paths[2], sizeof(g_canary_paths[2]), "%s/.gnupg/.secring_canary.gpg", home);
+}
+
 static void provision_canaries(void) {
-    mkdir_p(USER_HOME "/.ssh", 0700, USER_UID, USER_GID);
+    init_canary_paths();
+    char home[PATH_MAX], ssh_dir[PATH_MAX + 16], gpg_dir[PATH_MAX + 16];
+    resolve_home_dir(home, sizeof(home));
+    snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home);
+    snprintf(gpg_dir, sizeof(gpg_dir), "%s/.gnupg", home);
+    mkdir_p(ssh_dir, 0700, USER_UID, USER_GID);
     mkdir_p(VAULT_DIR, 0700, USER_UID, USER_GID);
-    mkdir_p(USER_HOME "/.gnupg", 0700, USER_UID, USER_GID);
+    mkdir_p(gpg_dir, 0700, USER_UID, USER_GID);
 
     const char *payloads[3] = {
         "-----BEGIN OPENSSH PRIVATE KEY-----\n"
@@ -2384,12 +2371,18 @@ static void add_inotify_watch_path(int ifd, const char *path, bool is_integrity_
 static int setup_inotify_persistence(void) {
     int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     if (ifd < 0) return -1;
-    mkdir_p(USER_HOME "/.config/systemd/user", 0755, USER_UID, USER_GID);
+    char home[PATH_MAX], p_sysd[PATH_MAX + 32], p_ssh[PATH_MAX + 16], p_bash[PATH_MAX + 16], p_prof[PATH_MAX + 16];
+    resolve_home_dir(home, sizeof(home));
+    snprintf(p_sysd, sizeof(p_sysd), "%s/.config/systemd/user", home);
+    snprintf(p_ssh, sizeof(p_ssh), "%s/.ssh", home);
+    snprintf(p_bash, sizeof(p_bash), "%s/.bashrc", home);
+    snprintf(p_prof, sizeof(p_prof), "%s/.profile", home);
+    mkdir_p(p_sysd, 0755, USER_UID, USER_GID);
     add_inotify_watch_path(ifd, "/etc/systemd/system", false);
-    add_inotify_watch_path(ifd, USER_HOME "/.config/systemd/user", false);
-    add_inotify_watch_path(ifd, USER_HOME "/.ssh", false);
-    add_inotify_watch_path(ifd, USER_HOME "/.bashrc", false);
-    add_inotify_watch_path(ifd, USER_HOME "/.profile", false);
+    add_inotify_watch_path(ifd, p_sysd, false);
+    add_inotify_watch_path(ifd, p_ssh, false);
+    add_inotify_watch_path(ifd, p_bash, false);
+    add_inotify_watch_path(ifd, p_prof, false);
     return ifd;
 }
 
@@ -2434,24 +2427,31 @@ static int setup_cn_proc_netlink(void) {
         return -1;
     }
 
-    struct __attribute__((aligned(NLMSG_ALIGNTO))) {
-        struct nlmsghdr nl_hdr;
-        struct __attribute__((__packed__)) {
-            struct cn_msg cn_hdr;
-            enum proc_cn_mcast_op cn_mcast;
-        };
-    } msg;
+    enum {
+        CN_PROC_MSG_SIZE = NLMSG_HDRLEN + sizeof(struct cn_msg) + sizeof(enum proc_cn_mcast_op)
+    };
+    uint8_t msg_buf[CN_PROC_MSG_SIZE] __attribute__((aligned(NLMSG_ALIGNTO)));
+    memset(msg_buf, 0, sizeof(msg_buf));
 
-    memset(&msg, 0, sizeof(msg));
-    msg.nl_hdr.nlmsg_len = sizeof(msg);
-    msg.nl_hdr.nlmsg_pid = (uint32_t)getpid();
-    msg.nl_hdr.nlmsg_type = NLMSG_DONE;
-    msg.cn_hdr.id.idx = CN_IDX_PROC;
-    msg.cn_hdr.id.val = CN_VAL_PROC;
-    msg.cn_hdr.len = sizeof(enum proc_cn_mcast_op);
-    msg.cn_mcast = PROC_CN_MCAST_LISTEN;
+    struct nlmsghdr nl_hdr;
+    memset(&nl_hdr, 0, sizeof(nl_hdr));
+    nl_hdr.nlmsg_len = (uint32_t)sizeof(msg_buf);
+    nl_hdr.nlmsg_pid = (uint32_t)getpid();
+    nl_hdr.nlmsg_type = NLMSG_DONE;
 
-    if (send(nl_fd, &msg, sizeof(msg), 0) < 0) {
+    struct cn_msg cn_hdr;
+    memset(&cn_hdr, 0, sizeof(cn_hdr));
+    cn_hdr.id.idx = CN_IDX_PROC;
+    cn_hdr.id.val = CN_VAL_PROC;
+    cn_hdr.len = (uint16_t)sizeof(enum proc_cn_mcast_op);
+
+    enum proc_cn_mcast_op cn_mcast = PROC_CN_MCAST_LISTEN;
+
+    memcpy(msg_buf, &nl_hdr, sizeof(nl_hdr));
+    memcpy(msg_buf + NLMSG_HDRLEN, &cn_hdr, sizeof(cn_hdr));
+    memcpy(msg_buf + NLMSG_HDRLEN + sizeof(struct cn_msg), &cn_mcast, sizeof(cn_mcast));
+
+    if (send(nl_fd, msg_buf, sizeof(msg_buf), 0) < 0) {
         close(nl_fd);
         return -1;
     }
@@ -2896,7 +2896,27 @@ static bool is_sensitive_config_entry(const char *name) {
     return false;
 }
 
-#define HSHIELD_MAX_PORTS 64
+#define HSHIELD_MAX_PORTS       64
+#define HSHIELD_MAX_ALLOW_WRITE 16
+
+static bool is_sensitive_allow_write_path(const char *wp, const char *canon_home) {
+    if (!wp || !wp[0]) return true;
+    if (canon_home && canon_home[0] && strcmp(wp, canon_home) == 0) return true;
+    static const char *const blocked_subs[] = {
+        "/.ssh", "/.gnupg", "/.aws", "/.kube", "/.docker", "/.pki", "/.netrc",
+        "/.claude", "/.codex", "/.gemini", "/.opencodex",
+        "/.config/gh", "/.config/hub", "/.config/google-chrome", "/.config/chromium",
+        "/.config/hephaestus", "/.mozilla", "/hephaestus/vault", NULL
+    };
+    for (int i = 0; blocked_subs[i]; i++) {
+        const char *hit = strstr(wp, blocked_subs[i]);
+        if (hit) {
+            size_t blen = strlen(blocked_subs[i]);
+            if (hit[blen] == '\0' || hit[blen] == '/') return true;
+        }
+    }
+    return false;
+}
 
 static void add_unique_port(uint16_t *out, int *count, int max_ports, uint16_t port) {
     for (int i = 0; i < *count; i++) {
@@ -2948,7 +2968,8 @@ static void print_sandbox_usage(void) {
 }
 
 static int cmd_sandbox_impl(int argc, char **argv, bool default_agent) {
-    const char *allow_write_dir = NULL;
+    const char *allow_write_dirs[HSHIELD_MAX_ALLOW_WRITE];
+    int n_allow_write = 0;
     bool deny_net = false;
     bool strict_net = false;
     bool agent_preset = default_agent;
@@ -2960,7 +2981,15 @@ static int cmd_sandbox_impl(int argc, char **argv, bool default_agent) {
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--allow-write") == 0 && i + 1 < argc) {
-            allow_write_dir = argv[++i];
+            if (n_allow_write < HSHIELD_MAX_ALLOW_WRITE) {
+                allow_write_dirs[n_allow_write++] = argv[++i];
+            } else {
+                i++;
+            }
+        } else if (strncmp(argv[i], "--allow-write=", 14) == 0 && argv[i][14] != '\0') {
+            if (n_allow_write < HSHIELD_MAX_ALLOW_WRITE) {
+                allow_write_dirs[n_allow_write++] = argv[i] + 14;
+            }
         } else if (strcmp(argv[i], "--deny-net") == 0) {
             deny_net = true;
         } else if (strcmp(argv[i], "--strict-net") == 0) {
@@ -2998,7 +3027,7 @@ static int cmd_sandbox_impl(int argc, char **argv, bool default_agent) {
     }
 
     if (agent_preset) {
-        if (!allow_write_dir || !allow_write_dir[0]) allow_write_dir = ".";
+        if (n_allow_write == 0) allow_write_dirs[n_allow_write++] = ".";
         deny_net = true;
         add_unique_port(connect_ports, &n_connect_ports, HSHIELD_MAX_PORTS, 443);
     }
@@ -3107,13 +3136,24 @@ static int cmd_sandbox_impl(int argc, char **argv, bool default_agent) {
         landlock_allow_path(rfd, ro_sys[i], fs_ro);
     }
 
-    /* 2. Safe Scratch / Device Paths */
+    /* 2. Safe Scratch & Safe Character Devices Only (never blanket RW /dev or /dev/shm!) */
     landlock_allow_path(rfd, "/tmp", fs_rw);
-    landlock_allow_path(rfd, "/dev", fs_rw);
+    uint64_t dev_rw = (LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE) & fs_rw;
+    if (abi >= 3) dev_rw |= LANDLOCK_ACCESS_FS_TRUNCATE;
+    if (abi >= 5) dev_rw |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
+    static const char *const safe_devs[] = {
+        "/dev/null", "/dev/zero", "/dev/full", "/dev/urandom", "/dev/random", "/dev/tty", NULL
+    };
+    for (int i = 0; safe_devs[i]; i++) {
+        landlock_allow_path(rfd, safe_devs[i], dev_rw);
+    }
+    landlock_allow_path(rfd, "/dev/fd", fs_ro);
 
     /* 3. Selective $HOME Enumeration: completely omit secrets & make shell RC files Read-Only! */
-    const char *home = getenv("HOME");
-    if (!home || !home[0]) home = USER_HOME;
+    char home_buf[PATH_MAX];
+    resolve_home_dir(home_buf, sizeof(home_buf));
+    char canon_home[PATH_MAX];
+    const char *home = realpath(home_buf, canon_home) ? canon_home : home_buf;
     DIR *hd = opendir(home);
     if (hd) {
         struct dirent *de;
@@ -3143,13 +3183,16 @@ static int cmd_sandbox_impl(int argc, char **argv, bool default_agent) {
         closedir(hd);
     }
 
-    if (allow_write_dir && allow_write_dir[0]) {
+    for (int i = 0; i < n_allow_write; i++) {
+        const char *raw_w = allow_write_dirs[i];
+        if (!raw_w || !raw_w[0]) continue;
         char real_w[PATH_MAX];
-        const char *wp = realpath(allow_write_dir, real_w) ? real_w : allow_write_dir;
-        if (!strstr(wp, "/.ssh") && !strstr(wp, "/.gnupg") &&
-            !strstr(wp, "/hephaestus/vault") && !strstr(wp, "/google-chrome")) {
-            landlock_allow_path(rfd, wp, fs_rw);
+        const char *wp = realpath(raw_w, real_w) ? real_w : raw_w;
+        if (is_sensitive_allow_write_path(wp, home)) {
+            fprintf(stderr, "hshield sandbox: refusing --allow-write on sensitive path: %s\n", wp);
+            continue;
         }
+        landlock_allow_path(rfd, wp, fs_rw);
     }
 
     if (ll_restrict_self(rfd, 0) != 0) {
@@ -3169,167 +3212,701 @@ static int cmd_sandbox(int argc, char **argv) {
 }
 
 /* =========================================================================
- * Repo-Trap & MCP Cryptographic Pin Auditor (`hshield audit`)
+ * Cross-Directory Repo-Trap & Supply-Chain Auditor (`hshield audit`)
  * ========================================================================= */
-static bool check_file_for_prompt_trap(const char *path, char *finding_out, size_t cap) {
-    char buf[16384];
-    ssize_t n = read_file_fast(path, buf, sizeof(buf));
-    if (n <= 0) return false;
+#define AUDIT_MAX_DEPTH     24
+#define AUDIT_MAX_FILE_READ (512U * 1024U)
+#define AUDIT_MAX_FINDINGS  128
 
-    /* Check invisible zero-width / bidi trojan-source Unicode sequences */
-    for (ssize_t i = 0; i + 2 < n; i++) {
-        unsigned char b0 = (unsigned char)buf[i];
-        unsigned char b1 = (unsigned char)buf[i + 1];
-        unsigned char b2 = (unsigned char)buf[i + 2];
-        if (b0 == 0xE2 && b1 == 0x80 &&
-            (b2 == 0x8B || b2 == 0x8C || b2 == 0x8D || (b2 >= 0xAA && b2 <= 0xAE))) {
-            snprintf(finding_out, cap, "zero_width_or_bidi_trojan_unicode");
-            return true;
+typedef struct {
+    char kind[40];
+    char severity[16];
+    char path[PATH_MAX];
+    char detail[256];
+} AuditFinding;
+
+typedef struct {
+    char canon_root[PATH_MAX];
+    size_t canon_root_len;
+    uint64_t scanned_files;
+    size_t finding_count;
+    AuditFinding findings[AUDIT_MAX_FINDINGS];
+    char legacy_summary[4096];
+    size_t legacy_used;
+    bool quarantine_mode;
+} RepoAuditCtx;
+
+static const char *ci_strstr_local(const char *hay, const char *needle) {
+    if (!hay || !needle) return NULL;
+    size_t nlen = strlen(needle);
+    if (nlen == 0) return hay;
+    for (const char *p = hay; *p; p++) {
+        if (tolower((unsigned char)*p) == tolower((unsigned char)needle[0])) {
+            size_t i = 1;
+            while (i < nlen && p[i] &&
+                   tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i])) {
+                i++;
+            }
+            if (i == nlen) return p;
         }
     }
+    return NULL;
+}
 
-    /* Case-insensitive scan for prompt injection / rogue hook execution */
-    char low[16384];
-    for (ssize_t i = 0; i < n; i++) low[i] = (char)tolower((unsigned char)buf[i]);
-    low[n] = '\0';
+static bool str_ends_with_ci_local(const char *s, const char *suffix) {
+    if (!s || !suffix) return false;
+    size_t sl = strlen(s), xl = strlen(suffix);
+    if (xl > sl) return false;
+    return strcasecmp(s + (sl - xl), suffix) == 0;
+}
 
-    const char *bad_patterns[] = {
+static void normalize_lexical_path(const char *in, char *out, size_t cap) {
+    if (!in || cap < 2) {
+        if (cap > 0) out[0] = '\0';
+        return;
+    }
+    char copy[PATH_MAX * 2];
+    snprintf(copy, sizeof(copy), "%s", in);
+    bool is_abs = (copy[0] == '/');
+    const char *segs[256];
+    int nsegs = 0;
+    char *p = copy;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        char *start = p;
+        while (*p && *p != '/') p++;
+        if (*p) *p++ = '\0';
+        if (strcmp(start, ".") == 0) continue;
+        if (strcmp(start, "..") == 0) {
+            if (nsegs > 0 && strcmp(segs[nsegs - 1], "..") != 0) {
+                nsegs--;
+            } else if (!is_abs && nsegs < 256) {
+                segs[nsegs++] = "..";
+            }
+        } else if (nsegs < 256) {
+            segs[nsegs++] = start;
+        }
+    }
+    size_t pos = 0;
+    if (is_abs) out[pos++] = '/';
+    for (int i = 0; i < nsegs; i++) {
+        if (i > 0 && pos + 1 < cap) out[pos++] = '/';
+        size_t sl = strlen(segs[i]);
+        if (pos + sl >= cap) break;
+        memcpy(out + pos, segs[i], sl);
+        pos += sl;
+    }
+    if (pos == 0) out[pos++] = is_abs ? '/' : '.';
+    out[pos] = '\0';
+}
+
+static bool path_within_root(const char *path, const char *root) {
+    if (!path || !root || !root[0]) return false;
+    size_t rlen = strlen(root);
+    if (rlen == 1 && root[0] == '/') return path[0] == '/';
+    if (strncmp(path, root, rlen) != 0) return false;
+    return path[rlen] == '\0' || path[rlen] == '/';
+}
+
+static const char *rel_path_from_root(const RepoAuditCtx *ctx, const char *full) {
+    if (ctx->canon_root_len > 0 &&
+        strncmp(full, ctx->canon_root, ctx->canon_root_len) == 0 &&
+        full[ctx->canon_root_len] == '/') {
+        return full + ctx->canon_root_len + 1;
+    }
+    return full;
+}
+
+static void audit_record_finding(RepoAuditCtx *ctx, const char *kind, const char *sev,
+                                 const char *path, const char *detail, const char *legacy_tag) {
+    if (ctx->finding_count < AUDIT_MAX_FINDINGS) {
+        AuditFinding *f = &ctx->findings[ctx->finding_count++];
+        snprintf(f->kind, sizeof(f->kind), "%s", kind);
+        snprintf(f->severity, sizeof(f->severity), "%s", sev);
+        snprintf(f->path, sizeof(f->path), "%s", path);
+        snprintf(f->detail, sizeof(f->detail), "%s", detail);
+    }
+    const char *tag = (legacy_tag && legacy_tag[0]) ? legacy_tag : detail;
+    if (ctx->legacy_used + 200 < sizeof(ctx->legacy_summary)) {
+        int n = snprintf(ctx->legacy_summary + ctx->legacy_used,
+                         sizeof(ctx->legacy_summary) - ctx->legacy_used,
+                         "%s; ", tag);
+        if (n > 0) ctx->legacy_used += (size_t)n;
+    }
+}
+
+static uint8_t *audit_slurp_bounded(const char *path, size_t max_bytes, size_t *out_len) {
+    *out_len = 0;
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+        close(fd);
+        return NULL;
+    }
+    size_t to_read = (size_t)st.st_size;
+    if (to_read > max_bytes) to_read = max_bytes;
+    uint8_t *buf = malloc(to_read + 1);
+    if (!buf) {
+        close(fd);
+        return NULL;
+    }
+    size_t got = 0;
+    while (got < to_read) {
+        ssize_t r = read(fd, buf + got, to_read - got);
+        if (r <= 0) break;
+        got += (size_t)r;
+    }
+    close(fd);
+    buf[got] = '\0';
+    *out_len = got;
+    return buf;
+}
+
+static void audit_inspect_trojan_unicode(RepoAuditCtx *ctx, const char *full_path,
+                                         const uint8_t *buf, size_t len) {
+    size_t probe = (len < 512) ? len : 512;
+    if (memchr(buf, 0, probe) != NULL) return;
+
+    size_t line = 1;
+    for (size_t i = 0; i < len; i++) {
+        if (buf[i] == '\n') { line++; continue; }
+        /* UTF-8 E2 80 [AA..AE] (LRE..RLO) or E2 80 [8B..8F] (ZWSP/ZWNJ/ZWJ/LRM/RLM) */
+        if (i + 2 < len && buf[i] == 0xE2 && buf[i + 1] == 0x80) {
+            uint8_t b2 = buf[i + 2];
+            if ((b2 >= 0xAA && b2 <= 0xAE) || (b2 >= 0x8B && b2 <= 0x8F)) {
+                char msg[256], ltag[256];
+                snprintf(msg, sizeof(msg),
+                         "zero_width_or_bidi_trojan_unicode (U+20%02X at line %zu)",
+                         (unsigned)b2, line);
+                snprintf(ltag, sizeof(ltag), "prompt_injection_trap(%.120s:zero_width_or_bidi_trojan_unicode)",
+                         rel_path_from_root(ctx, full_path));
+                audit_record_finding(ctx, "trojan_unicode", "high", full_path, msg, ltag);
+                return;
+            }
+        }
+        /* UTF-8 E2 81 [A6..A9] (LRI, RLI, FSI, PDI) */
+        if (i + 2 < len && buf[i] == 0xE2 && buf[i + 1] == 0x81) {
+            uint8_t b2 = buf[i + 2];
+            if (b2 >= 0xA6 && b2 <= 0xA9) {
+                char msg[256], ltag[256];
+                snprintf(msg, sizeof(msg),
+                         "zero_width_or_bidi_trojan_unicode (isolate U+20%02X at line %zu)",
+                         (unsigned)(b2 - 0x40), line);
+                snprintf(ltag, sizeof(ltag), "prompt_injection_trap(%.120s:zero_width_or_bidi_trojan_unicode)",
+                         rel_path_from_root(ctx, full_path));
+                audit_record_finding(ctx, "trojan_unicode", "high", full_path, msg, ltag);
+                return;
+            }
+        }
+        /* Unicode Tag smuggling U+E0001..U+E007F */
+        if (i + 3 < len && buf[i] == 0xF3 && buf[i + 1] == 0xA0 &&
+            (buf[i + 2] == 0x80 || buf[i + 2] == 0x81)) {
+            char msg[256], ltag[256];
+            snprintf(msg, sizeof(msg),
+                     "zero_width_or_bidi_trojan_unicode (Unicode Tag smuggling at line %zu)", line);
+            snprintf(ltag, sizeof(ltag), "prompt_injection_trap(%.120s:zero_width_or_bidi_trojan_unicode)",
+                     rel_path_from_root(ctx, full_path));
+            audit_record_finding(ctx, "trojan_unicode", "high", full_path, msg, ltag);
+            return;
+        }
+    }
+}
+
+static bool audit_is_doc_or_rule_file(const char *base) {
+    if (!base) return false;
+    if (strcasecmp(base, "AGENTS.md") == 0 ||
+        strcasecmp(base, "CLAUDE.md") == 0 ||
+        strcasecmp(base, "GEMINI.md") == 0 ||
+        strcasecmp(base, ".cursorrules") == 0 ||
+        strcasecmp(base, ".windsurfrules") == 0 ||
+        strcasecmp(base, "copilot-instructions.md") == 0) {
+        return true;
+    }
+    return (str_ends_with_ci_local(base, ".md") ||
+            str_ends_with_ci_local(base, ".mdc") ||
+            str_ends_with_ci_local(base, ".txt") ||
+            str_ends_with_ci_local(base, ".rst"));
+}
+
+static void audit_inspect_prompt_injection(RepoAuditCtx *ctx, const char *full_path, const char *text) {
+    static const char *const directives[] = {
         "ignore previous instructions",
         "ignore all previous instructions",
+        "disregard all previous instructions",
+        "disregard prior instructions",
         "disregard security",
-        "guvenlik kurallarini yoksay",
-        "güvenlik kurallarını yoksay",
-        "curl ", "wget ", "nc -e", "/dev/tcp/",
-        "base64 -d", "eval(", "hvault", ".ssh/id_",
+        "forget all previous instructions",
+        "new system instructions:",
+        "system prompt override",
+        "you are now in developer mode",
         NULL
     };
-    for (int i = 0; bad_patterns[i]; i++) {
-        if (strstr(low, bad_patterns[i])) {
-            snprintf(finding_out, cap, "suspicious_directive:%s", bad_patterns[i]);
-            return true;
+    for (int i = 0; directives[i]; i++) {
+        if (ci_strstr_local(text, directives[i]) != NULL) {
+            char msg[256], ltag[256];
+            snprintf(msg, sizeof(msg), "prompt-injection directive: '%s'", directives[i]);
+            snprintf(ltag, sizeof(ltag), "prompt_injection_trap(%.100s:suspicious_directive:%.60s)",
+                     rel_path_from_root(ctx, full_path), directives[i]);
+            audit_record_finding(ctx, "prompt_injection", "high", full_path, msg, ltag);
+            return;
         }
+    }
+    const char *cstart = strstr(text, "<!--");
+    while (cstart) {
+        const char *cend = strstr(cstart + 4, "-->");
+        if (!cend) break;
+        size_t clen = (size_t)(cend - (cstart + 4));
+        if (clen > 0 && clen < 4096) {
+            char snippet[4096];
+            memcpy(snippet, cstart + 4, clen);
+            snippet[clen] = '\0';
+            if ((ci_strstr_local(snippet, "curl ") || ci_strstr_local(snippet, "wget ") ||
+                 ci_strstr_local(snippet, ".ssh") || ci_strstr_local(snippet, "exfiltrate")) &&
+                (ci_strstr_local(snippet, "assistant") || ci_strstr_local(snippet, "agent") ||
+                 ci_strstr_local(snippet, "do not tell") || ci_strstr_local(snippet, "silently") ||
+                 ci_strstr_local(snippet, "run "))) {
+                char ltag[256];
+                snprintf(ltag, sizeof(ltag), "prompt_injection_trap(%.120s:hidden_html_directive)",
+                         rel_path_from_root(ctx, full_path));
+                audit_record_finding(ctx, "prompt_injection", "high", full_path,
+                                     "hidden HTML comment contains covert agent execution/exfiltration directive",
+                                     ltag);
+                return;
+            }
+        }
+        cstart = strstr(cend + 3, "<!--");
+    }
+}
+
+static bool audit_lifecycle_val_suspicious(const char *val) {
+    static const char *const indicators[] = {
+        "curl ", "curl\t", "wget ", "nc ", "ncat ", "socat ", "/dev/tcp/",
+        "bash -c", "sh -c", "zsh -c", "eval ", "base64", "chmod +x",
+        "child_process", "urllib", "subprocess", "os.system", "pty.spawn",
+        ".ssh", ".aws", ".gnupg", ".netrc", "powershell", NULL
+    };
+    for (int i = 0; indicators[i]; i++) {
+        if (ci_strstr_local(val, indicators[i]) != NULL) return true;
     }
     return false;
 }
 
+static void audit_inspect_package_json(RepoAuditCtx *ctx, const char *full_path, const char *text) {
+    static const char *const hooks[] = {
+        "\"preinstall\"", "\"install\"", "\"postinstall\"",
+        "\"preuninstall\"", "\"postuninstall\"", "\"prepare\"", NULL
+    };
+    for (int i = 0; hooks[i]; i++) {
+        const char *p = strstr(text, hooks[i]);
+        while (p) {
+            const char *colon = strchr(p + strlen(hooks[i]), ':');
+            if (!colon) break;
+            const char *q = colon + 1;
+            while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+            if (*q == '"') {
+                q++;
+                char val[1024];
+                size_t vi = 0;
+                while (*q && *q != '"' && vi + 1 < sizeof(val)) {
+                    if (*q == '\\' && q[1]) { val[vi++] = q[1]; q += 2; }
+                    else { val[vi++] = *q++; }
+                }
+                val[vi] = '\0';
+                if (audit_lifecycle_val_suspicious(val)) {
+                    char msg[256], ltag[256];
+                    snprintf(msg, sizeof(msg), "suspicious npm %s hook: %.140s", hooks[i], val);
+                    snprintf(ltag, sizeof(ltag), "build_script_trap:%.120s", rel_path_from_root(ctx, full_path));
+                    audit_record_finding(ctx, "build_script_trap", "high", full_path, msg, ltag);
+                    return;
+                }
+            }
+            p = strstr(colon + 1, hooks[i]);
+        }
+    }
+}
+
+static void audit_inspect_build_files(RepoAuditCtx *ctx, const char *full_path,
+                                      const char *base, const char *text) {
+    if (strcasecmp(base, "package.json") == 0) {
+        audit_inspect_package_json(ctx, full_path, text);
+    } else if (strcasecmp(base, "setup.py") == 0) {
+        bool has_exec = (strstr(text, "os.system(") != NULL ||
+                         strstr(text, "subprocess.") != NULL ||
+                         strstr(text, "pty.spawn") != NULL ||
+                         strstr(text, "base64.b64decode") != NULL);
+        bool has_net = (strstr(text, "urllib") != NULL || strstr(text, "requests.") != NULL ||
+                        strstr(text, "socket.") != NULL || strstr(text, "curl ") != NULL ||
+                        strstr(text, "wget ") != NULL || strstr(text, "/dev/tcp/") != NULL ||
+                        strstr(text, "exec(") != NULL || strstr(text, "eval(") != NULL ||
+                        strstr(text, ".ssh") != NULL);
+        if ((has_exec && has_net) || strstr(text, "/dev/tcp/") != NULL) {
+            char ltag[256];
+            snprintf(ltag, sizeof(ltag), "build_script_trap:%.120s", rel_path_from_root(ctx, full_path));
+            audit_record_finding(ctx, "build_script_trap", "high", full_path,
+                                 "setup.py contains install-time code execution / network payload", ltag);
+        }
+    } else if (strcasecmp(base, "pyproject.toml") == 0 ||
+               strcasecmp(base, "Makefile") == 0 ||
+               strcasecmp(base, "GNUmakefile") == 0) {
+        if (strstr(text, "/dev/tcp/") != NULL ||
+            (ci_strstr_local(text, "curl ") && (strstr(text, "| sh") || strstr(text, "| bash") || strstr(text, "|sh") || strstr(text, "|bash"))) ||
+            (ci_strstr_local(text, "wget ") && (strstr(text, "| sh") || strstr(text, "| bash") || strstr(text, "|sh") || strstr(text, "|bash"))) ||
+            (strstr(text, "base64 -d") && (strstr(text, "| sh") || strstr(text, "| bash") || strstr(text, "eval "))) ||
+            strstr(text, "nc -e /bin/") != NULL) {
+            char ltag[256];
+            snprintf(ltag, sizeof(ltag), "build_script_trap:%.120s", rel_path_from_root(ctx, full_path));
+            audit_record_finding(ctx, "build_script_trap", "high", full_path,
+                                 "build file contains remote pipe-to-shell or reverse-shell recipe", ltag);
+        }
+    }
+}
+
+static void audit_inspect_git_dir(RepoAuditCtx *ctx, const char *git_dir) {
+    char cfg_path[PATH_MAX];
+    snprintf(cfg_path, sizeof(cfg_path), "%.*s/config", (int)sizeof(cfg_path) - 16, git_dir);
+    size_t cfg_len = 0;
+    uint8_t *cfg_buf = audit_slurp_bounded(cfg_path, 262144, &cfg_len);
+    if (cfg_buf) {
+        ctx->scanned_files++;
+        const char *text = (const char *)cfg_buf;
+        if (ci_strstr_local(text, "fsmonitor") || ci_strstr_local(text, "sshCommand") ||
+            ci_strstr_local(text, "hooksPath") || ci_strstr_local(text, "ProxyCommand")) {
+            char ltag[256];
+            snprintf(ltag, sizeof(ltag), "git_config_trap:%.120s", rel_path_from_root(ctx, cfg_path));
+            audit_record_finding(ctx, "git_config_trap", "high", cfg_path,
+                                 ".git/config defines custom execution hook (fsmonitor/sshCommand/hooksPath)", ltag);
+        }
+        free(cfg_buf);
+    }
+
+    char hooks_dir[PATH_MAX];
+    snprintf(hooks_dir, sizeof(hooks_dir), "%.*s/hooks", (int)sizeof(hooks_dir) - 16, git_dir);
+    DIR *d = opendir(hooks_dir);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        const char *name = de->d_name;
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+        if (str_ends_with_ci_local(name, ".sample") || strncasecmp(name, "README", 6) == 0) continue;
+        char hp[PATH_MAX];
+        snprintf(hp, sizeof(hp), "%.*s/%.*s", (int)(sizeof(hp) - 260), hooks_dir, 250, name);
+        struct stat st;
+        if (lstat(hp, &st) != 0) continue;
+        ctx->scanned_files++;
+        if (S_ISLNK(st.st_mode)) {
+            char ltag[256];
+            snprintf(ltag, sizeof(ltag), "git_hook_trap:%.120s", rel_path_from_root(ctx, hp));
+            audit_record_finding(ctx, "git_hook_trap", "high", hp,
+                                 "symlinked git hook inside .git/hooks", ltag);
+            continue;
+        }
+        if (!S_ISREG(st.st_mode)) continue;
+        size_t hlen = 0;
+        uint8_t *hbuf = audit_slurp_bounded(hp, 262144, &hlen);
+        bool exec_bit = ((st.st_mode & 0111) != 0);
+        bool has_susp = false;
+        if (hbuf) {
+            const char *ht = (const char *)hbuf;
+            if (ci_strstr_local(ht, "curl ") || ci_strstr_local(ht, "wget ") ||
+                ci_strstr_local(ht, "/dev/tcp/") || ci_strstr_local(ht, "nc ") ||
+                ci_strstr_local(ht, "socat ") || ci_strstr_local(ht, "base64") ||
+                ci_strstr_local(ht, "python") || ci_strstr_local(ht, "nohup") ||
+                ci_strstr_local(ht, ".ssh")) {
+                has_susp = true;
+            }
+            free(hbuf);
+        }
+        if (exec_bit || has_susp) {
+            char msg[256], ltag[256];
+            snprintf(msg, sizeof(msg), "active git hook '%.120s' (%s)",
+                     name, has_susp ? "contains network/exec primitives" : "executable non-sample hook");
+            snprintf(ltag, sizeof(ltag), "git_hook_trap:%.120s", rel_path_from_root(ctx, hp));
+            audit_record_finding(ctx, "git_hook_trap", "high", hp, msg, ltag);
+        }
+    }
+    closedir(d);
+}
+
+static void audit_inspect_symlink(RepoAuditCtx *ctx, const char *parent_dir, const char *full_path) {
+    char link_target[PATH_MAX];
+    ssize_t rl = readlink(full_path, link_target, sizeof(link_target) - 1);
+    if (rl < 0) return;
+    link_target[rl] = '\0';
+
+    char resolved[PATH_MAX];
+    if (realpath(full_path, resolved) != NULL) {
+        if (!path_within_root(resolved, ctx->canon_root)) {
+            char msg[256], ltag[256];
+            snprintf(msg, sizeof(msg), "symlink escapes repository root -> %.140s", link_target);
+            snprintf(ltag, sizeof(ltag), "symlink_escape:%.120s", rel_path_from_root(ctx, full_path));
+            audit_record_finding(ctx, "symlink_escape", "high", full_path, msg, ltag);
+        }
+        return;
+    }
+
+    char real_parent[PATH_MAX];
+    if (realpath(parent_dir, real_parent) == NULL) {
+        snprintf(real_parent, sizeof(real_parent), "%.*s", (int)sizeof(real_parent) - 1, parent_dir);
+    }
+    char joined[PATH_MAX * 2];
+    if (link_target[0] == '/') {
+        snprintf(joined, sizeof(joined), "%s", link_target);
+    } else {
+        snprintf(joined, sizeof(joined), "%s/%s", real_parent, link_target);
+    }
+    char norm[PATH_MAX];
+    normalize_lexical_path(joined, norm, sizeof(norm));
+    if (!path_within_root(norm, ctx->canon_root)) {
+        char msg[256], ltag[256];
+        snprintf(msg, sizeof(msg), "dangling symlink escapes repository root -> %.140s", link_target);
+        snprintf(ltag, sizeof(ltag), "symlink_escape:%.120s", rel_path_from_root(ctx, full_path));
+        audit_record_finding(ctx, "symlink_escape", "high", full_path, msg, ltag);
+    }
+}
+
+static bool audit_is_agent_config_path(const char *rel_path, const char *base) {
+    return (strcasecmp(base, ".mcp.json") == 0 ||
+            str_ends_with_ci_local(rel_path, ".claude/settings.json") ||
+            str_ends_with_ci_local(rel_path, ".claude/settings.local.json") ||
+            str_ends_with_ci_local(rel_path, ".claude/mcp.json") ||
+            str_ends_with_ci_local(rel_path, ".codex/config.toml") ||
+            str_ends_with_ci_local(rel_path, ".codex/config.json") ||
+            str_ends_with_ci_local(rel_path, ".gemini/settings.json") ||
+            str_ends_with_ci_local(rel_path, ".cursor/mcp.json") ||
+            str_ends_with_ci_local(rel_path, ".cursor/hooks.json") ||
+            str_ends_with_ci_local(rel_path, ".vscode/mcp.json"));
+}
+
+static void audit_inspect_regular_file(RepoAuditCtx *ctx, const char *full_path,
+                                       const char *base, bool trusted_ws) {
+    const char *rel = rel_path_from_root(ctx, full_path);
+
+    if (!trusted_ws && audit_is_agent_config_path(rel, base)) {
+        char msg[256], ltag[256];
+        snprintf(msg, sizeof(msg), "untrusted repo-local agent/MCP configuration: %.140s", rel);
+        snprintf(ltag, sizeof(ltag), "untrusted_repo_agent_trap:%.140s", rel);
+        audit_record_finding(ctx, "agent_config_trap", "high", full_path, msg, ltag);
+        if (ctx->quarantine_mode && strcasecmp(base, ".mcp.json") == 0) {
+            char disabled[PATH_MAX + 32];
+            snprintf(disabled, sizeof(disabled), "%.*s.blocked_by_hshield",
+                     (int)(sizeof(disabled) - 24), full_path);
+            (void)rename(full_path, disabled);
+        }
+        return;
+    }
+
+    size_t len = 0;
+    uint8_t *buf = audit_slurp_bounded(full_path, AUDIT_MAX_FILE_READ, &len);
+    if (!buf) return;
+
+    audit_inspect_trojan_unicode(ctx, full_path, buf, len);
+
+    const char *text = (const char *)buf;
+    if (!trusted_ws) {
+        audit_inspect_build_files(ctx, full_path, base, text);
+        if (audit_is_doc_or_rule_file(base)) {
+            audit_inspect_prompt_injection(ctx, full_path, text);
+        }
+    }
+    free(buf);
+}
+
+static bool audit_should_skip_dir(const char *name) {
+    return (strcmp(name, "__pycache__") == 0 ||
+            strcmp(name, ".pytest_cache") == 0 ||
+            strcmp(name, ".mypy_cache") == 0 ||
+            strcmp(name, ".ruff_cache") == 0 ||
+            strcmp(name, "node_modules") == 0 ||
+            strcmp(name, ".venv") == 0 ||
+            strcmp(name, "build") == 0 ||
+            strcmp(name, "dist") == 0);
+}
+
+static void audit_walk_dir(RepoAuditCtx *ctx, const char *dir_path, int depth, bool trusted_ws) {
+    if (depth > AUDIT_MAX_DEPTH) return;
+    DIR *d = opendir(dir_path);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        const char *name = de->d_name;
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+        char full[PATH_MAX];
+        int n = snprintf(full, sizeof(full), "%s/%s", dir_path, name);
+        if (n < 0 || (size_t)n >= sizeof(full)) continue;
+        struct stat st;
+        if (lstat(full, &st) != 0) continue;
+
+        if (S_ISLNK(st.st_mode)) {
+            ctx->scanned_files++;
+            audit_inspect_symlink(ctx, dir_path, full);
+            continue;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            if (strcmp(name, ".git") == 0) {
+                audit_inspect_git_dir(ctx, full);
+                continue;
+            }
+            if (audit_should_skip_dir(name)) continue;
+            audit_walk_dir(ctx, full, depth + 1, trusted_ws);
+            continue;
+        }
+        if (S_ISREG(st.st_mode)) {
+            ctx->scanned_files++;
+            audit_inspect_regular_file(ctx, full, name, trusted_ws);
+        }
+    }
+    closedir(d);
+}
+
 static bool is_trusted_own_workspace(const char *real_dir) {
-    return (strcmp(real_dir, "/home/user") == 0 ||
-            strncmp(real_dir, "/opt/hshield-trusted", 37) == 0 ||
-            strncmp(real_dir, "/opt/protected-workloads", 26) == 0);
+    const char *env_trusted = getenv("HSHIELD_TRUSTED_DIRS");
+    if (!env_trusted || !env_trusted[0] || !real_dir || !real_dir[0]) return false;
+    const char *p = env_trusted;
+    while (*p) {
+        const char *colon = strchr(p, ':');
+        size_t len = colon ? (size_t)(colon - p) : strlen(p);
+        if (len > 0 && len < PATH_MAX) {
+            char cand[PATH_MAX], canon[PATH_MAX];
+            memcpy(cand, p, len);
+            cand[len] = '\0';
+            const char *root = realpath(cand, canon) ? canon : cand;
+            if (path_within_root(real_dir, root)) return true;
+        }
+        if (!colon) break;
+        p = colon + 1;
+    }
+    return false;
 }
 
 static int cmd_audit(int argc, char **argv) {
     bool json = false;
+    bool quarantine_mode = false;
     const char *target_dir = ".";
     for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "--json") == 0 || strcmp(argv[i], "-j") == 0) json = true;
-        else if (argv[i][0] != '-') target_dir = argv[i];
+        if (strcmp(argv[i], "--json") == 0 || strcmp(argv[i], "-j") == 0) {
+            json = true;
+        } else if (strcmp(argv[i], "--quarantine") == 0) {
+            quarantine_mode = true;
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            fprintf(stderr, "Usage: hshield audit [DIR] [--json] [--quarantine]\n");
+            return 0;
+        } else if (argv[i][0] != '-') {
+            target_dir = argv[i];
+        } else {
+            fprintf(stderr, "hshield audit: unknown option '%s'\n", argv[i]);
+            return 2;
+        }
     }
 
-    char real_dir[PATH_MAX];
-    if (!realpath(target_dir, real_dir)) snprintf(real_dir, sizeof(real_dir), "%.1024s", target_dir);
-    bool trusted_ws = is_trusted_own_workspace(real_dir);
+    struct stat target_st;
+    if (lstat(target_dir, &target_st) != 0) {
+        fprintf(stderr, "hshield audit: cannot access '%s': %s\n", target_dir, strerror(errno));
+        return 2;
+    }
 
-    int issues = 0;
-    char findings[4096] = {0};
-    size_t f_used = 0;
+    RepoAuditCtx *ctx = calloc(1, sizeof(RepoAuditCtx));
+    if (!ctx) return 2;
+    ctx->quarantine_mode = quarantine_mode;
 
-    /* 1. Verify MCP SHA-256 Pin (`/etc/hephaestus/mcp_pins.json`) */
-    bool mcp_pin_ok = false;
-    char pin_buf[2048];
-    if (read_file_fast(ETC_MCP_PINS_PATH, pin_buf, sizeof(pin_buf)) > 0) {
-        uint8_t mcp_sha[32];
-        if (sha256_file("/usr/local/bin/hephaestus-mcp", mcp_sha)) {
-            char mcp_hex[65];
-            bytes_to_hex(mcp_sha, 32, mcp_hex);
-            if (strstr(pin_buf, mcp_hex) != NULL) {
-                mcp_pin_ok = true;
-            } else {
-                issues++;
-                f_used += (size_t)snprintf(findings + f_used, sizeof(findings) - f_used,
-                                           "chameleon_mcp_hash_mismatch(/usr/local/bin/hephaestus-mcp); ");
+    if (realpath(target_dir, ctx->canon_root) == NULL) {
+        normalize_lexical_path(target_dir, ctx->canon_root, sizeof(ctx->canon_root));
+    }
+    ctx->canon_root_len = strlen(ctx->canon_root);
+    bool trusted_ws = is_trusted_own_workspace(ctx->canon_root);
+
+    /* 1. Optional MCP SHA-256 Pin Verification (opt-in via HSHIELD_MCP_PINS & HSHIELD_MCP_BIN) */
+    bool mcp_pin_ok = true;
+    const char *pins_env = getenv("HSHIELD_MCP_PINS");
+    const char *mcp_bin = getenv("HSHIELD_MCP_BIN");
+    if (pins_env && pins_env[0] && mcp_bin && mcp_bin[0]) {
+        char pin_buf[2048];
+        if (read_file_fast(pins_env, pin_buf, sizeof(pin_buf)) > 0) {
+            uint8_t mcp_sha[32];
+            if (sha256_file(mcp_bin, mcp_sha)) {
+                char mcp_hex[65];
+                bytes_to_hex(mcp_sha, 32, mcp_hex);
+                if (strstr(pin_buf, mcp_hex) == NULL) {
+                    mcp_pin_ok = false;
+                    audit_record_finding(ctx, "mcp_pin_mismatch", "high", mcp_bin,
+                                         "MCP binary SHA-256 does not match HSHIELD_MCP_PINS",
+                                         "chameleon_mcp_hash_mismatch");
+                }
             }
         }
     }
 
-    /* 2. Scan target repository for Repo Traps (`.mcp.json`, `.claude*`, `.codex*`, `.gemini*`, `AGENTS.md`) */
-    const char *trap_candidates[] = {
-        ".mcp.json",
-        ".claude/settings.json",
-        ".claude/settings.local.json",
-        ".codex/config.toml",
-        ".gemini/settings.json",
-        "AGENTS.md",
-        "CLAUDE.md",
-        "GEMINI.md",
-        NULL
-    };
-
-    for (int i = 0; trap_candidates[i]; i++) {
-        char p[1536];
-        snprintf(p, sizeof(p), "%.1000s/%s", real_dir, trap_candidates[i]);
-        struct stat st;
-        if (stat(p, &st) != 0) continue;
-
-        /* Untrusted repo defining `.mcp.json` or local `.claude/settings*` hooks is an immediate Repo Trap! */
-        if (!trusted_ws && (strcmp(trap_candidates[i], ".mcp.json") == 0 ||
-                            strncmp(trap_candidates[i], ".claude/", 8) == 0 ||
-                            strncmp(trap_candidates[i], ".codex/", 7) == 0 ||
-                            strncmp(trap_candidates[i], ".gemini/", 8) == 0)) {
-            issues++;
-            if (f_used + 160 < sizeof(findings)) {
-                f_used += (size_t)snprintf(findings + f_used, sizeof(findings) - f_used,
-                                           "untrusted_repo_agent_trap:%s; ", trap_candidates[i]);
-            }
-            /* Strip execute bits and quarantine/neutralize `.mcp.json` in untrusted scratch/download repos */
-            if (is_untrusted_origin_path(real_dir) && strcmp(trap_candidates[i], ".mcp.json") == 0) {
-                char disabled[1600];
-                snprintf(disabled, sizeof(disabled), "%.1500s.blocked_by_hshield", p);
-                (void)rename(p, disabled);
-            }
-            continue;
+    /* 2. Recursive repository / single-file inspection (read-only unless --quarantine) */
+    if (S_ISDIR(target_st.st_mode)) {
+        audit_walk_dir(ctx, ctx->canon_root, 0, trusted_ws);
+    } else if (S_ISLNK(target_st.st_mode)) {
+        char parent[PATH_MAX];
+        snprintf(parent, sizeof(parent), "%.*s", (int)sizeof(parent) - 1, target_dir);
+        char *slash = strrchr(parent, '/');
+        if (slash) *slash = '\0';
+        else snprintf(parent, sizeof(parent), ".");
+        if (realpath(parent, ctx->canon_root) == NULL) {
+            normalize_lexical_path(parent, ctx->canon_root, sizeof(ctx->canon_root));
         }
-
-        char trap_detail[160] = {0};
-        if (!trusted_ws && check_file_for_prompt_trap(p, trap_detail, sizeof(trap_detail))) {
-            issues++;
-            if (f_used + 200 < sizeof(findings)) {
-                f_used += (size_t)snprintf(findings + f_used, sizeof(findings) - f_used,
-                                           "prompt_injection_trap(%s:%s); ", trap_candidates[i], trap_detail);
-            }
-        }
+        ctx->canon_root_len = strlen(ctx->canon_root);
+        ctx->scanned_files = 1;
+        audit_inspect_symlink(ctx, parent, target_dir);
+    } else if (S_ISREG(target_st.st_mode)) {
+        const char *slash = strrchr(target_dir, '/');
+        const char *base = slash ? (slash + 1) : target_dir;
+        ctx->scanned_files = 1;
+        audit_inspect_regular_file(ctx, ctx->canon_root, base, trusted_ws);
     }
 
-    /* 3. Persistence Integrity Check (`/etc/ld.so.preload`) */
+    /* 3. Host persistence check (`/etc/ld.so.preload`) */
     struct stat lst;
     if (stat("/etc/ld.so.preload", &lst) == 0 && lst.st_size > 0) {
-        issues++;
-        if (f_used + 96 < sizeof(findings)) {
-            f_used += (size_t)snprintf(findings + f_used, sizeof(findings) - f_used,
-                                       "non_empty_etc_ld_so_preload; ");
-        }
+        audit_record_finding(ctx, "ld_so_preload", "high", "/etc/ld.so.preload",
+                             "non-empty /etc/ld.so.preload persistence file",
+                             "non_empty_etc_ld_so_preload");
     }
 
+    int issues = (int)ctx->finding_count;
     if (json) {
         char dir_e[1200], find_e[4200];
-        json_escape(real_dir, dir_e, sizeof(dir_e));
-        json_escape(findings, find_e, sizeof(find_e));
+        json_escape(ctx->canon_root, dir_e, sizeof(dir_e));
+        json_escape(ctx->legacy_summary, find_e, sizeof(find_e));
         printf("{\"ok\":%s,\"dir\":\"%s\",\"trusted_workspace\":%s,\"mcp_pin_verified\":%s,"
-               "\"issues\":%d,\"findings\":\"%s\"}\n",
+               "\"scanned_files\":%" PRIu64 ",\"issues\":%d,\"findings\":\"%s\",\"finding_details\":[",
                (issues == 0) ? "true" : "false",
                dir_e,
                trusted_ws ? "true" : "false",
                mcp_pin_ok ? "true" : "false",
+               ctx->scanned_files,
                issues,
                find_e);
+        for (size_t i = 0; i < ctx->finding_count; i++) {
+            char ke[64], se[32], pe[1200], de_s[512];
+            json_escape(ctx->findings[i].kind, ke, sizeof(ke));
+            json_escape(ctx->findings[i].severity, se, sizeof(se));
+            json_escape(ctx->findings[i].path, pe, sizeof(pe));
+            json_escape(ctx->findings[i].detail, de_s, sizeof(de_s));
+            if (i > 0) fputc(',', stdout);
+            printf("{\"kind\":\"%s\",\"severity\":\"%s\",\"path\":\"%s\",\"detail\":\"%s\"}",
+                   ke, se, pe, de_s);
+        }
+        printf("]}\n");
     } else {
-        printf("[hshield audit] dir=%s trusted=%s mcp_pin=%s issues=%d\n",
-               real_dir, trusted_ws ? "yes" : "no", mcp_pin_ok ? "SEALED" : "UNPINNED/MISMATCH", issues);
-        if (issues > 0) {
-            printf("  FINDINGS: %s\n", findings);
+        printf("[hshield audit] dir=%s scanned=%" PRIu64 " trusted=%s issues=%d\n",
+               ctx->canon_root, ctx->scanned_files, trusted_ws ? "yes" : "no", issues);
+        for (size_t i = 0; i < ctx->finding_count; i++) {
+            printf("  [%s] %s (%s): %s\n",
+                   ctx->findings[i].severity,
+                   ctx->findings[i].path,
+                   ctx->findings[i].kind,
+                   ctx->findings[i].detail);
         }
     }
-    return (issues == 0) ? 0 : 1;
+
+    int rc = (issues == 0) ? 0 : 1;
+    free(ctx);
+    return rc;
 }
 
 /* =========================================================================
@@ -3654,7 +4231,7 @@ int main(int argc, char **argv) {
            "                                               Run CMD inside 0%%-CPU Landlock LSM armor\n"
            "  hshield agent   [--allow-write DIR] [--allow-tcp-connect PORTS] -- CMD\n"
            "                                               Coding-agent preset (RW cwd + HTTPS 443)\n"
-           "  hshield audit [DIR] [--json]                 Verify MCP pins & scan repo for AI traps\n"
+           "  hshield audit [DIR] [--json] [--quarantine]  Recursively audit repo for AI & supply-chain traps\n"
            "  hshield quarantine [list|inspect ID|add F R] Manage AES-256-GCM quarantine vault\n"
            "  hshield evolve [--file F|--sha256 H|--pattern P] [--reason R]\n"
            "  hshield restore <PATH...>                    <30ms Btrfs CoW surgical file repair\n"

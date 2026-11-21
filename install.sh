@@ -43,13 +43,22 @@ if [ "${HSHIELD_FROM_SOURCE:-0}" != "1" ] && [ "${ARCH}" = "x86_64" ] && need_cm
     TARBALL="hshield-linux-x86_64.tar.gz"
     if curl -fsSL "${BASE_URL}/${TARBALL}" -o "${tmpdir}/${TARBALL}" 2>/dev/null && \
        curl -fsSL "${BASE_URL}/SHA256SUMS" -o "${tmpdir}/SHA256SUMS" 2>/dev/null; then
-        (cd "${tmpdir}" && grep "${TARBALL}" SHA256SUMS | sha256sum -c - >/dev/null)
-        tar -xzf "${tmpdir}/${TARBALL}" -C "${tmpdir}"
-        mkdir -p "${BINDIR}"
-        install -m 0755 "${tmpdir}/hshield" "${BINDIR}/hshield"
-        install -m 0755 "${tmpdir}/hshield-supply-scan" "${BINDIR}/hshield-supply-scan"
-        echo "Installed hshield and hshield-supply-scan to ${BINDIR} (verified SHA-256)"
-        exit 0
+        verified=0
+        if need_cmd sha256sum; then
+            (cd "${tmpdir}" && grep -F "  ${TARBALL}" SHA256SUMS | sha256sum -c - >/dev/null) && verified=1
+        elif need_cmd shasum; then
+            (cd "${tmpdir}" && grep -F "  ${TARBALL}" SHA256SUMS | shasum -a 256 -c - >/dev/null) && verified=1
+        else
+            echo "Warning: neither sha256sum nor shasum found; refusing unverified binary, falling back to source build." >&2
+        fi
+        if [ "${verified}" -eq 1 ]; then
+            tar -xzf "${tmpdir}/${TARBALL}" -C "${tmpdir}"
+            mkdir -p "${BINDIR}"
+            install -m 0755 "${tmpdir}/hshield" "${BINDIR}/hshield"
+            install -m 0755 "${tmpdir}/hshield-supply-scan" "${BINDIR}/hshield-supply-scan"
+            echo "Installed hshield and hshield-supply-scan to ${BINDIR} (verified SHA-256)"
+            exit 0
+        fi
     fi
 fi
 

@@ -174,14 +174,46 @@ static void json_escape(const char *src, char *dst, size_t cap) {
     dst[j] = '\0';
 }
 
+#define HSHIELD_SUPPLY_SCAN_VERSION "0.2.1"
+#define ZIP_MAX_COMPRESSED_SCAN     (2U * 1024U * 1024U)
+#define ZIP_MAX_INFLATE_SCAN        (1024U * 1024U)
+
+static bool match_short_pickle_mod(const uint8_t *buf, size_t len, const char *mod, uint8_t mlen) {
+    uint8_t short_u[16];
+    if ((size_t)mlen + 2U <= sizeof(short_u)) {
+        short_u[0] = 0x8c;
+        short_u[1] = mlen;
+        memcpy(short_u + 2, mod, mlen);
+        if (memmem(buf, len, short_u, (size_t)mlen + 2) != NULL) return true;
+    }
+    uint8_t bin_u[16];
+    if ((size_t)mlen + 4U <= sizeof(bin_u)) {
+        bin_u[0] = mlen; bin_u[1] = 0; bin_u[2] = 0; bin_u[3] = 0;
+        memcpy(bin_u + 4, mod, mlen);
+        if (memmem(buf, len, bin_u, (size_t)mlen + 4) != NULL) return true;
+    }
+    char p0[16];
+    int n0 = snprintf(p0, sizeof(p0), "c%s\n", mod);
+    if (n0 > 0 && memmem(buf, len, p0, (size_t)n0) != NULL) return true;
+    int n1 = snprintf(p0, sizeof(p0), "i%s\n", mod);
+    if (n1 > 0 && memmem(buf, len, p0, (size_t)n1) != NULL) return true;
+    int n2 = snprintf(p0, sizeof(p0), "S'%s'", mod);
+    if (n2 > 0 && memmem(buf, len, p0, (size_t)n2) != NULL) return true;
+    return false;
+}
+
 static bool scan_pickle_stream_for_rce(const uint8_t *buf, size_t len, char *why, size_t wcap) {
     if (!buf || len < 6) return false;
 
     static const char *const proto0_sigs[] = {
         "cos\nsystem", "cposix\nsystem", "cnt\nsystem",
-        "cos\npopen", "cposix\npopen", "csubprocess\n",
-        "cbuiltins\neval", "cbuiltins\nexec", "c__builtin__\neval",
-        "c__builtin__\nexec", "cpty\nspawn", "ios\nsystem", "iposix\nsystem", NULL
+        "cos\npopen", "cposix\npopen", "cnt\npopen", "csubprocess\n",
+        "cbuiltins\neval", "cbuiltins\nexec", "cbuiltins\n__import__",
+        "c__builtin__\neval", "c__builtin__\nexec", "c__builtin__\n__import__",
+        "cimportlib\nimport_module", "coperator\nattrgetter",
+        "cwebbrowser\nopen", "cpty\nspawn",
+        "ios\nsystem", "iposix\nsystem", "ios\npopen", "iposix\npopen",
+        "isubprocess\n", "ibuiltins\neval", "ibuiltins\nexec", NULL
     };
     for (int i = 0; proto0_sigs[i]; i++) {
         size_t sl = strlen(proto0_sigs[i]);
@@ -192,18 +224,27 @@ static bool scan_pickle_stream_for_rce(const uint8_t *buf, size_t len, char *why
         }
     }
 
-    bool looks_pickle = (buf[0] == 0x80 && buf[1] >= 2 && buf[1] <= 5) ||
-                        (memchr(buf, 0x93, len) != NULL && memchr(buf, 'R', len) != NULL);
-    if (!looks_pickle) return false;
+    const char *exec_op = NULL;
+    if (memchr(buf, 'R', len) != NULL) exec_op = "REDUCE";
+    else if (memchr(buf, 0x81, len) != NULL) exec_op = "NEWOBJ";
+    else if (memchr(buf, 0x92, len) != NULL) exec_op = "NEWOBJ_EX";
+    else if (memchr(buf, 'b', len) != NULL) exec_op = "BUILD";
+    else if (memchr(buf, 'o', len) != NULL) exec_op = "OBJ";
+    else if (memchr(buf, 'i', len) != NULL) exec_op = "INST";
 
-    bool has_reduce = (memchr(buf, 'R', len) != NULL);
-    if (!has_reduce) return false;
+    bool looks_pickle = (buf[0] == 0x80 && buf[1] >= 2 && buf[1] <= 5) ||
+                        (memchr(buf, 0x93, len) != NULL && exec_op != NULL) ||
+                        (memchr(buf, 'c', len) != NULL && exec_op != NULL);
+    if (!looks_pickle || !exec_op) return false;
 
     static const char *const bad_mods[] = {
-        "posix", "subprocess", "builtins", "__builtin__", "pty", "runpy", "commands", NULL
+        "posix", "subprocess", "builtins", "__builtin__", "pty", "runpy", "commands",
+        "importlib", "operator", "ctypes", "marshal", "webbrowser", "shutil", NULL
     };
     static const char *const bad_fns[] = {
-        "system", "popen", "Popen", "check_output", "eval", "exec", "spawn", NULL
+        "system", "popen", "Popen", "check_output", "check_call", "call",
+        "eval", "exec", "compile", "spawn", "__import__", "import_module",
+        "attrgetter", "getattr", "loads", "open", "rmtree", "unlink", NULL
     };
 
     const char *hit_mod = NULL;
@@ -213,22 +254,21 @@ static bool scan_pickle_stream_for_rce(const uint8_t *buf, size_t len, char *why
             break;
         }
     }
-    if (!hit_mod && (memmem(buf, len, "\x8c\x02os", 4) != NULL ||
-                     memmem(buf, len, "\x02\x00\x00\x00os", 6) != NULL ||
-                     memmem(buf, len, "cos\n", 4) != NULL)) {
-        hit_mod = "os";
-    }
+    if (!hit_mod && match_short_pickle_mod(buf, len, "os", 2)) hit_mod = "os";
+    if (!hit_mod && match_short_pickle_mod(buf, len, "nt", 2)) hit_mod = "nt";
+    if (!hit_mod && match_short_pickle_mod(buf, len, "sys", 3)) hit_mod = "sys";
+    if (!hit_mod && match_short_pickle_mod(buf, len, "pip", 3)) hit_mod = "pip";
+    if (!hit_mod && match_short_pickle_mod(buf, len, "code", 4)) hit_mod = "code";
     if (!hit_mod) return false;
 
     for (int j = 0; bad_fns[j]; j++) {
         if (memmem(buf, len, bad_fns[j], strlen(bad_fns[j])) != NULL) {
-            snprintf(why, wcap, "pickle-rce-opcode:%s.%s+REDUCE", hit_mod, bad_fns[j]);
+            snprintf(why, wcap, "pickle-rce-opcode:%s.%s+%s", hit_mod, bad_fns[j], exec_op);
             return true;
         }
     }
     return false;
 }
-
 static bool scan_zip_for_pickle_or_repotrap(int fd, off_t fsize, char *why, size_t wcap) {
     off_t tail_sz = (fsize > 65558) ? 65558 : fsize;
     uint8_t *tail = malloc((size_t)tail_sz);
@@ -284,44 +324,49 @@ static bool scan_zip_for_pickle_or_repotrap(int fd, off_t fsize, char *why, size
         bool is_pkl = (nl > 4 && (strcmp(entry + nl - 4, ".pkl") == 0 ||
                                   (nl > 7 && strcmp(entry + nl - 7, ".pickle") == 0)));
         bool is_mcp_trap = (strstr(entry, ".mcp.json") != NULL ||
-                            strstr(entry, ".claude/settings") != NULL);
+                            strstr(entry, ".claude/settings") != NULL ||
+                            strstr(entry, ".codex/config") != NULL ||
+                            strstr(entry, ".gemini/settings") != NULL ||
+                            strstr(entry, ".cursor/hooks.json") != NULL);
 
-        if ((is_pkl || is_mcp_trap) && csize > 0 && csize <= 262144 && (off_t)lhoff + 30 < fsize) {
+        /* Flag embedded agent/MCP trap paths immediately regardless of entry size or compression */
+        if (is_mcp_trap) {
+            snprintf(why, wcap, "archive-repo-trap:%.200s", entry);
+            malicious = true;
+            break;
+        }
+
+        if (is_pkl && csize > 0 && (off_t)lhoff + 30 < fsize) {
             uint8_t lh[30];
             if (pread(fd, lh, 30, (off_t)lhoff) == 30 && memcmp(lh, "PK\x03\x04", 4) == 0) {
                 uint16_t lfn = (uint16_t)(lh[26] | (lh[27] << 8));
                 uint16_t lex = (uint16_t)(lh[28] | (lh[29] << 8));
                 off_t data_off = (off_t)lhoff + 30 + lfn + lex;
-                if (data_off + (off_t)csize <= fsize) {
-                    uint8_t *cbuf = malloc(csize);
-                    if (cbuf && pread(fd, cbuf, csize, data_off) == (ssize_t)csize) {
+                if (data_off < fsize) {
+                    size_t avail_file = (size_t)(fsize - data_off);
+                    size_t read_len = (csize < ZIP_MAX_COMPRESSED_SCAN) ? (size_t)csize : ZIP_MAX_COMPRESSED_SCAN;
+                    if (read_len > avail_file) read_len = avail_file;
+                    uint8_t *cbuf = malloc(read_len);
+                    if (cbuf && pread(fd, cbuf, read_len, data_off) == (ssize_t)read_len) {
                         if (method == 0) {
-                            if (is_pkl && scan_pickle_stream_for_rce(cbuf, csize, why, wcap)) {
-                                malicious = true;
-                            } else if (is_mcp_trap) {
-                                snprintf(why, wcap, "archive-repo-trap:%.200s", entry);
+                            if (scan_pickle_stream_for_rce(cbuf, read_len, why, wcap)) {
                                 malicious = true;
                             }
                         } else if (method == 8) {
-                            size_t ucap = 262144;
+                            size_t ucap = ZIP_MAX_INFLATE_SCAN;
                             uint8_t *ubuf = malloc(ucap);
                             if (ubuf) {
                                 z_stream zs = {0};
                                 if (inflateInit2(&zs, -MAX_WBITS) == Z_OK) {
                                     zs.next_in = cbuf;
-                                    zs.avail_in = csize;
+                                    zs.avail_in = (uInt)read_len;
                                     zs.next_out = ubuf;
                                     zs.avail_out = (uInt)ucap;
                                     (void)inflate(&zs, Z_SYNC_FLUSH);
                                     size_t got = ucap - zs.avail_out;
                                     inflateEnd(&zs);
-                                    if (got > 0) {
-                                        if (is_pkl && scan_pickle_stream_for_rce(ubuf, got, why, wcap)) {
-                                            malicious = true;
-                                        } else if (is_mcp_trap) {
-                                            snprintf(why, wcap, "archive-repo-trap:%.200s", entry);
-                                            malicious = true;
-                                        }
+                                    if (got > 0 && scan_pickle_stream_for_rce(ubuf, got, why, wcap)) {
+                                        malicious = true;
                                     }
                                 }
                                 free(ubuf);
@@ -414,14 +459,25 @@ int main(int argc, char **argv) {
     bool json = false;
     int threats_found = 0;
 
+    int file_count = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--json") == 0 || strcmp(argv[i], "-j") == 0) {
             json = true;
+        } else if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
+            printf("hshield-supply-scan v%s\n", HSHIELD_SUPPLY_SCAN_VERSION);
+            return 0;
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("hshield-supply-scan v%s — Zero-Import Pickle VM & Archive Supply-Chain Scanner\n"
+                   "Usage: hshield-supply-scan [--json] <file...>\n",
+                   HSHIELD_SUPPLY_SCAN_VERSION);
+            return 0;
+        } else {
+            file_count++;
         }
     }
 
-    if (argc < 2 || (argc == 2 && json)) {
-        fprintf(stderr, "Usage: hshield-supply-scan [--json] <file...>\\n");
+    if (file_count == 0) {
+        fprintf(stderr, "Usage: hshield-supply-scan [--json] <file...>\n");
         return 2;
     }
 
@@ -430,7 +486,7 @@ int main(int argc, char **argv) {
         const char *path = argv[i];
         struct stat st;
         if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
-            fprintf(stderr, "hshield-supply-scan: cannot stat regular file: %s\\n", path);
+            fprintf(stderr, "hshield-supply-scan: cannot stat regular file: %s\n", path);
             return 2;
         }
         const char *base = strrchr(path, '/');

